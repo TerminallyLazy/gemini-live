@@ -46,15 +46,68 @@ type MediaStreamButtonProps = {
 const MediaStreamButton = memo(
   ({ isStreaming, onIcon, offIcon, start, stop }: MediaStreamButtonProps) =>
     isStreaming ? (
-      <button className="action-button" onClick={stop}>
+      <button className="action-button" onClick={stop} title="Stop streaming">
         <span className="material-symbols-outlined">{onIcon}</span>
       </button>
     ) : (
-      <button className="action-button" onClick={start}>
+      <button className="action-button" onClick={start} title="Start streaming">
         <span className="material-symbols-outlined">{offIcon}</span>
       </button>
     ),
 );
+
+// Add draggable functionality
+const useDraggable = (ref: RefObject<HTMLElement>) => {
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const dragStart = useRef({ x: 0, y: 0 });
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+
+    const handleMouseDown = (e: MouseEvent) => {
+      setIsDragging(true);
+      dragStart.current = {
+        x: e.clientX - position.x,
+        y: e.clientY - position.y
+      };
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDragging) return;
+      
+      const newX = e.clientX - dragStart.current.x;
+      const newY = e.clientY - dragStart.current.y;
+      
+      // Keep tray within viewport bounds
+      const rect = element.getBoundingClientRect();
+      const maxX = window.innerWidth - rect.width;
+      const maxY = window.innerHeight - rect.height;
+      
+      setPosition({
+        x: Math.min(Math.max(0, newX), maxX),
+        y: Math.min(Math.max(0, newY), maxY)
+      });
+    };
+
+    const handleMouseUp = () => {
+      setIsDragging(false);
+    };
+
+    element.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      element.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [ref, isDragging, position]);
+
+  return { position, isDragging };
+};
 
 function ControlTray({
   videoRef,
@@ -62,6 +115,8 @@ function ControlTray({
   onVideoStreamChange = () => {},
   supportsVideo,
 }: ControlTrayProps) {
+  const trayRef = useRef<HTMLElement>(null);
+  const { position, isDragging } = useDraggable(trayRef);
   const videoStreams = [useWebcam(), useScreenCapture()];
   const [activeVideoStream, setActiveVideoStream] =
     useState<MediaStream | null>(null);
@@ -157,18 +212,27 @@ function ControlTray({
   };
 
   return (
-    <section className="control-tray">
+    <section 
+      ref={trayRef}
+      className={cn("control-tray", { dragging: isDragging })}
+      style={{
+        position: 'fixed',
+        transform: `translate(${position.x}px, ${position.y}px)`,
+        cursor: isDragging ? 'grabbing' : 'grab',
+        left: 'auto',
+        bottom: 'auto'
+      }}
+    >
       <canvas style={{ display: "none" }} ref={renderCanvasRef} />
       <nav className={cn("actions-nav", { disabled: !connected })}>
         <button
           className={cn("action-button mic-button")}
           onClick={() => setMuted(!muted)}
+          title={muted ? "Unmute microphone" : "Mute microphone"}
         >
-          {!muted ? (
-            <span className="material-symbols-outlined filled">mic</span>
-          ) : (
-            <span className="material-symbols-outlined filled">mic_off</span>
-          )}
+          <span className="material-symbols-outlined">
+            {muted ? "mic_off" : "mic"}
+          </span>
         </button>
 
         <div className="action-button no-action outlined">
@@ -181,8 +245,8 @@ function ControlTray({
               isStreaming={screenCapture.isStreaming}
               start={changeStreams(screenCapture)}
               stop={changeStreams()}
-              onIcon="cancel_presentation"
-              offIcon="present_to_all"
+              onIcon="stop_screen_share"
+              offIcon="screen_share"
             />
             <MediaStreamButton
               isStreaming={webcam.isStreaming}
@@ -197,17 +261,16 @@ function ControlTray({
       </nav>
 
       <div className={cn("connection-container", { connected })}>
-        <div className="connection-button-container">
-          <button
-            ref={connectButtonRef}
-            className={cn("action-button connect-toggle", { connected })}
-            onClick={connected ? disconnect : connect}
-          >
-            <span className="material-symbols-outlined filled">
-              {connected ? "pause" : "play_arrow"}
-            </span>
-          </button>
-        </div>
+        <button
+          ref={connectButtonRef}
+          className={cn("action-button connect-toggle")}
+          onClick={connected ? disconnect : connect}
+          title={connected ? "Stop streaming" : "Start streaming"}
+        >
+          <span className="material-symbols-outlined">
+            {connected ? "stop" : "play_arrow"}
+          </span>
+        </button>
         <span className="text-indicator">Streaming</span>
       </div>
     </section>

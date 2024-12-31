@@ -11,26 +11,31 @@
 
     .react-select__menu {
       background: var(--Neutral-20);
-      color: var(--Neutral-90);
-    }
+        color: var(--Neutral-90);
+      }
 
-    .react-select__option {
-    }
-    .react-select__value-container {
-    }
-    .react-select__indicators {
-    }
-    .react-select__option:hover,
-    .react-select__option:focus,
-    .react-select_option:focus-within {
-      background: var(--Neutral-30);
-    }
-    .react-select__option--is-focused: {
-      background: var(--Neutral-30);
-    }
-  }
-  background: var(--Neutral-00);
-  width: 40px; /* when closed */
+      .react-select__option {
+        padding: 8px 12px;
+      }
+
+      .react-select__value-container {
+        padding: 2px 8px;
+      }
+
+      .react-select__indicators {
+        padding: 0 4px;
+      }
+
+      .react-select__option:hover,
+      .react-select__option:focus,
+      .react-select_option:focus-within {
+        background: var(--Neutral-30);
+      }
+      .react-select__option--is-focused {
+        background: var(--Neutral-30);
+      }
+      background: var(--Neutral-00);
+      width: 40px; /* when closed */
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -265,4 +270,5 @@
   font-size: 1.25rem;
   line-height: 1.75rem;
   padding: 4px;
+}
 }

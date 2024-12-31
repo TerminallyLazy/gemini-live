@@ -2,63 +2,55 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useLiveAPIContext } from '../../contexts/LiveAPIContext';
 import './GeminiUI.scss';
 import type { Part } from "@google/generative-ai";
-
-declare global {
-  interface Window {
-    $3Dmol: typeof $3Dmol;
-  }
-}
+import { useDraggable } from '../../hooks/use-draggable';
+import cn from 'classnames';
 
 export const GeminiUI: React.FC = () => {
   const { client, connected, connect, disconnect } = useLiveAPIContext();
   const [isStreaming, setIsStreaming] = useState(false);
-  const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
-  const textInputRef = useRef<HTMLTextAreaElement>(null);
-  const eventLogRef = useRef<HTMLDivElement>(null);
-  const responseAreaRef = useRef<HTMLDivElement>(null);
-  const viewerRef = useRef<$3Dmol.Viewer | null>(null);
+  const [modelAudioEnabled, setModelAudioEnabled] = useState(true);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isWebcamOn, setIsWebcamOn] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [inputText, setInputText] = useState('');
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const screenShareRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const mediaControlsRef = useRef<HTMLDivElement>(null);
+  const { position: mediaPosition, isDragging: mediaIsDragging } = useDraggable(
+    mediaControlsRef,
+    { x: window.innerWidth / 2 - 200, y: window.innerHeight - 100 } // Initial position
+  );
 
   useEffect(() => {
-    const initViewer = () => {
-      if (!viewerRef.current && window.$3Dmol) {
-        const viewerConfig = {
-          backgroundColor: 'transparent',
-          antialias: true,
-          cartoonQuality: 10,
-          disableFog: true
-        };
-        
-        viewerRef.current = window.$3Dmol.createViewer('viewport', viewerConfig);
-        viewerRef.current.setBackgroundColor('transparent');
-        viewerRef.current.setStyle({}, { cartoon: { color: 'spectrum' } });
-        viewerRef.current.render();
+    const attemptConnection = async () => {
+      if (!connected && !isConnecting) {
+        try {
+          setIsConnecting(true);
+          await connect();
+          logEvent('Connected to Gemini API');
+        } catch (error) {
+          logEvent('Connection error: ' + (error as Error).message, true);
+        } finally {
+          setIsConnecting(false);
+        }
       }
     };
-
-    initViewer();
-  }, []);
-
-  // Auto-connect when component mounts
-  useEffect(() => {
-    if (!connected && !isConnecting) {
-      handleConnect();
-    }
-  }, [connected, isConnecting]);
-
-  const logEvent = (message: string, isError = false) => {
-    if (!eventLogRef.current) return;
     
-    const timestamp = new Date().toLocaleTimeString();
-    const logEntry = document.createElement('div');
-    logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${
-      isError ? '<span class="error">' + message + '</span>' : message
-    }`;
-    eventLogRef.current.appendChild(logEntry);
-    eventLogRef.current.scrollTop = eventLogRef.current.scrollHeight;
-  };
+    attemptConnection();
+    
+    return () => {
+      if (connected) {
+        handleDisconnect();
+      }
+    };
+  }, []); // Component mount only
 
   const handleConnect = async () => {
+    if (isConnecting) return;
+    
     try {
       setIsConnecting(true);
       await connect();
@@ -72,6 +64,12 @@ export const GeminiUI: React.FC = () => {
 
   const handleDisconnect = async () => {
     try {
+      if (mediaRecorderRef.current) {
+        await stopAudioRecording();
+      }
+      if (isScreenSharing) {
+        await toggleScreenShare();
+      }
       await disconnect();
       logEvent('Disconnected from Gemini API');
     } catch (error) {
@@ -81,167 +79,244 @@ export const GeminiUI: React.FC = () => {
 
   const startAudioRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
+      if (!connected) {
+        logEvent('Cannot start recording: WebSocket not connected', true);
+        return;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm',
       });
-      
-      setMediaStream(stream);
+
+      mediaRecorderRef.current = mediaRecorder;
       setIsStreaming(true);
-      logEvent('Started audio streaming');
-      
-      // Handle the audio stream with the existing client
-      // This will need to be implemented based on your audio processing needs
+
+      mediaRecorder.ondataavailable = async (event) => {
+        if (event.data.size > 0 && connected && isStreaming) {
+          try {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const base64Audio = (reader.result as string).split(',')[1];
+              client?.send([{
+                inlineData: {
+                  mimeType: 'audio/webm',
+                  data: base64Audio
+                }
+              }]);
+            };
+            reader.readAsDataURL(event.data);
+          } catch (error) {
+            logEvent('Error sending audio data: ' + (error as Error).message, true);
+          }
+        }
+      };
+
+      mediaRecorder.start(1000);
+      logEvent('Started audio recording');
     } catch (error) {
-      console.error('Error starting audio:', error);
-      logEvent('Error starting audio: ' + (error as Error).message, true);
-      stopAudioRecording();
+      logEvent('Error starting audio recording: ' + (error as Error).message, true);
+      setIsStreaming(false);
     }
   };
 
   const stopAudioRecording = () => {
-    if (mediaStream) {
-      mediaStream.getTracks().forEach(track => track.stop());
-    }
-    setMediaStream(null);
-    setIsStreaming(false);
-    logEvent('Stopped audio streaming');
-  };
-
-  const handleSendMessage = () => {
-    const text = textInputRef.current?.value.trim();
-    if (!text) return;
-
     try {
-      if (!connected) {
-        throw new Error('Not connected to Gemini API');
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+        mediaRecorderRef.current = null;
       }
-
-      const part: Part = { text };
-      client.send(part);
-      if (textInputRef.current) {
-        textInputRef.current.value = '';
-      }
-      logEvent('Sent message: ' + text);
+      setIsStreaming(false);
+      logEvent('Stopped audio recording');
     } catch (error) {
-      logEvent('Error sending message: ' + (error as Error).message, true);
+      logEvent('Error stopping audio recording: ' + (error as Error).message, true);
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
+  const toggleScreenShare = async () => {
+    try {
+      if (isScreenSharing) {
+        if (screenShareRef.current?.srcObject) {
+          const tracks = (screenShareRef.current.srcObject as MediaStream).getTracks();
+          tracks.forEach(track => track.stop());
+          screenShareRef.current.srcObject = null;
+        }
+        setIsScreenSharing(false);
+        logEvent('Screen sharing stopped');
+      } else {
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: false
+        });
+
+        if (screenShareRef.current) {
+          screenShareRef.current.srcObject = stream;
+        }
+
+        stream.getVideoTracks()[0].onended = () => {
+          setIsScreenSharing(false);
+          logEvent('Screen sharing stopped');
+        };
+
+        setIsScreenSharing(true);
+        logEvent('Screen sharing started');
+      }
+    } catch (error) {
+      logEvent('Error toggling screen share: ' + (error as Error).message, true);
+      setIsScreenSharing(false);
+    }
+  };
+
+  const toggleWebcam = async () => {
+    try {
+      if (isWebcamOn) {
+        if (videoRef.current?.srcObject) {
+          const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
+          tracks.forEach(track => track.stop());
+          videoRef.current.srcObject = null;
+        }
+        setIsWebcamOn(false);
+        logEvent('Camera turned off');
+      } else {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false
+        });
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+
+        setIsWebcamOn(true);
+        logEvent('Camera turned on');
+      }
+    } catch (error) {
+      logEvent('Error toggling webcam: ' + (error as Error).message, true);
+      setIsWebcamOn(false);
+    }
+  };
+
+  const logEvent = (message: string, isError = false) => {
+    const timestamp = new Date().toLocaleTimeString();
+    const logEntry = document.createElement('div');
+    logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${message}`;
+    if (isError) logEntry.className = 'error';
+    const eventLog = document.querySelector('.event-log');
+    if (eventLog) {
+      eventLog.appendChild(logEntry);
+      eventLog.scrollTop = eventLog.scrollHeight;
     }
   };
 
   return (
     <div className="gemini-ui">
       <div className="grid-bg"></div>
-      
-      {/* Left Panel */}
       <div className="main-display">
         <div className="visualization">
           <div id="viewport"></div>
           <div className="molecule-controls">
-            <button className="molecule-btn" id="resetViewBtn" title="Reset View">
-              <i className="fas fa-sync-alt"></i>
+            <button className="molecule-btn">
+              <i className="fas fa-arrows-rotate"></i>
             </button>
-            <button className="molecule-btn" id="fullscreenBtn" title="Fullscreen">
+            <button className="molecule-btn">
               <i className="fas fa-expand"></i>
-            </button>
-            <button className="molecule-btn" id="snapshotBtn" title="Take Snapshot">
-              <i className="fas fa-camera"></i>
             </button>
           </div>
         </div>
-        <div className="response-area" ref={responseAreaRef}></div>
+        <div className="response-area"></div>
       </div>
 
-      {/* Right Panel */}
       <div className="controls-panel">
         <div className="status">
-          <div className={`status-indicator ${connected ? 'status-connected' : isConnecting ? 'status-connecting' : 'status-disconnected'}`}></div>
-          <span>
-            {isConnecting ? 'Connecting...' : connected ? 'Connected' : 'Disconnected'}
-          </span>
-          {!connected && !isConnecting && (
-            <button 
-              className="btn btn-small" 
-              onClick={handleConnect}
-              style={{ marginLeft: '8px', padding: '4px 8px', fontSize: '12px' }}
-            >
-              Connect
-            </button>
-          )}
-          {connected && (
-            <button 
-              className="btn btn-small btn-error" 
-              onClick={handleDisconnect}
-              style={{ marginLeft: '8px', padding: '4px 8px', fontSize: '12px' }}
-            >
-              Disconnect
-            </button>
-          )}
+          <div className={`status-indicator ${connected ? 'status-connected' : ''}`}></div>
+          {connected ? 'Connected' : 'Disconnected'}
         </div>
-        
+
         <div className="input-group">
-          <textarea 
-            ref={textInputRef}
-            rows={3} 
-            placeholder="Type your message here..."
-            aria-label="Message input"
-            onKeyPress={handleKeyPress}
+          <textarea
+            value={inputText}
+            onChange={(e) => setInputText(e.target.value)}
+            placeholder="Type your message..."
+            rows={4}
           />
-          <button 
-            className="btn btn-icon" 
-            onClick={handleSendMessage}
-            disabled={!connected}
+          <button
+            className="btn btn-icon"
+            onClick={() => client?.send([{ text: inputText }])}
+            disabled={!connected || !inputText.trim()}
           >
             <i className="fas fa-paper-plane"></i>
           </button>
         </div>
 
-        <div className="audio-controls">
-          <div className="audio-buttons">
-            <button 
-              className="btn flex-1" 
-              onClick={startAudioRecording}
-              disabled={!connected || isStreaming}
-            >
-              <i className="fas fa-microphone"></i>
-              Start Audio
-            </button>
-            <button 
-              className="btn btn-error flex-1" 
-              onClick={stopAudioRecording}
-              disabled={!isStreaming}
-            >
-              <i className="fas fa-stop"></i>
-              Stop Audio
-            </button>
-          </div>
-          
-          <div className="audio-visualizer">
-            <canvas id="audioVisualizer"></canvas>
-            <div id="vadIndicator" className="vad-indicator"></div>
-          </div>
-          
-          <div className="audio-status">
-            <span>{isStreaming ? 'Microphone active' : 'Microphone inactive'}</span>
-            <div className="audio-level-container">
-              <div id="audioLevelBar" className="audio-level-bar"></div>
-            </div>
-          </div>
-        </div>
-
-        <div className="event-log" ref={eventLogRef}></div>
+        <div className="event-log"></div>
       </div>
+
+      <div 
+        ref={mediaControlsRef}
+        className={cn("media-controls", { dragging: mediaIsDragging })}
+        style={{
+          position: 'fixed',
+          transform: `translate(${mediaPosition.x}px, ${mediaPosition.y}px)`,
+          cursor: mediaIsDragging ? 'grabbing' : 'grab',
+          left: 'auto',
+          bottom: 'auto'
+        }}
+      >
+        <button
+          className={`control-btn ${isStreaming ? 'active' : ''}`}
+          onClick={isStreaming ? stopAudioRecording : startAudioRecording}
+          disabled={!connected}
+          title={isStreaming ? 'Turn off microphone' : 'Turn on microphone'}
+        >
+          <i className={`fas fa-${isStreaming ? 'microphone' : 'microphone-slash'}`}></i>
+        </button>
+        <button
+          className={`control-btn ${modelAudioEnabled ? 'active' : ''}`}
+          onClick={() => setModelAudioEnabled(!modelAudioEnabled)}
+          disabled={!connected}
+          title={modelAudioEnabled ? 'Mute model voice' : 'Unmute model voice'}
+        >
+          <i className={`fas fa-${modelAudioEnabled ? 'volume-up' : 'volume-mute'}`}></i>
+        </button>
+        <button
+          className={`control-btn ${isScreenSharing ? 'active' : ''}`}
+          onClick={toggleScreenShare}
+          disabled={!connected}
+          title={isScreenSharing ? 'Stop screen sharing' : 'Share screen'}
+        >
+          <i className="fas fa-desktop"></i>
+        </button>
+        <button
+          className={`control-btn ${isWebcamOn ? 'active' : ''}`}
+          onClick={toggleWebcam}
+          disabled={!connected}
+          title={isWebcamOn ? 'Turn off camera' : 'Turn on camera'}
+        >
+          <i className={`fas fa-${isWebcamOn ? 'video' : 'video-slash'}`}></i>
+        </button>
+        <button
+          className="control-btn"
+          onClick={() => client?.send([{ text: '' }], false)}
+          disabled={!connected}
+          title="Generate"
+        >
+          <i className="fas fa-play"></i>
+        </button>
+      </div>
+
+      <video 
+        ref={screenShareRef} 
+        style={{ display: 'none' }} 
+        autoPlay 
+        muted 
+      />
+      <video 
+        ref={videoRef} 
+        style={{ display: 'none' }} 
+        autoPlay 
+        muted
+      />
     </div>
   );
 };

@@ -67,7 +67,18 @@ export function useLiveAPI({
   }, [audioStreamerRef]);
 
   useEffect(() => {
+    const onOpen = () => {
+      console.log("WebSocket connection opened");
+      setConnected(true);
+    };
+
     const onClose = () => {
+      console.log("WebSocket connection closed");
+      setConnected(false);
+    };
+
+    const onError = (error: Event) => {
+      console.error("WebSocket error:", error);
       setConnected(false);
     };
 
@@ -77,32 +88,48 @@ export function useLiveAPI({
       audioStreamerRef.current?.addPCM16(new Uint8Array(data));
 
     client
+      .on("open", onOpen)
       .on("close", onClose)
+
       .on("interrupted", stopAudioStreamer)
       .on("audio", onAudio);
 
     return () => {
       client
+        .off("open", onOpen)
         .off("close", onClose)
+
         .off("interrupted", stopAudioStreamer)
         .off("audio", onAudio);
     };
   }, [client]);
 
   const connect = useCallback(async () => {
-    console.log(config);
     if (!config) {
       throw new Error("config has not been set");
     }
-    client.disconnect();
-    await client.connect(config);
-    setConnected(true);
-  }, [client, setConnected, config]);
+
+    try {
+      await client.disconnect();
+      await client.connect(config);
+      // Connected state will be set by the "open" event handler
+    } catch (error) {
+      console.error("Connection failed:", error);
+      setConnected(false);
+      throw error;
+    }
+  }, [client, config]);
 
   const disconnect = useCallback(async () => {
-    client.disconnect();
-    setConnected(false);
-  }, [setConnected, client]);
+    try {
+      await client.disconnect();
+      // Connected state will be set by the "close" event handler
+    } catch (error) {
+      console.error("Disconnect failed:", error);
+      setConnected(false);
+      throw error;
+    }
+  }, [client]);
 
   return {
     client,
