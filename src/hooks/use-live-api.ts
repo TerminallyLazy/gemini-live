@@ -84,23 +84,26 @@ export function useLiveAPI({
 
     const stopAudioStreamer = () => audioStreamerRef.current?.stop();
 
-    const onAudio = (data: ArrayBuffer) =>
+    const onAudio = (data: ArrayBuffer) => {
+      console.log('useLiveAPI onAudio:', data);
+      console.log('useLiveAPI onAudio data size:', data.byteLength);
       audioStreamerRef.current?.addPCM16(new Uint8Array(data));
+    };
 
     client
       .on("open", onOpen)
       .on("close", onClose)
-
       .on("interrupted", stopAudioStreamer)
-      .on("audio", onAudio);
+      .on("audio", onAudio)
+      .on("log", (log) => console.log('useLiveAPI client log:', log));
 
     return () => {
       client
         .off("open", onOpen)
         .off("close", onClose)
-
         .off("interrupted", stopAudioStreamer)
-        .off("audio", onAudio);
+        .off("audio", onAudio)
+        .off("log", (log) => console.log('useLiveAPI client log:', log));
     };
   }, [client]);
 

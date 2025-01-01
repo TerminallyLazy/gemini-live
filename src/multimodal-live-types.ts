@@ -240,3 +240,18 @@ export const isToolCallCancellation = (
   a: unknown,
 ): a is ToolCallCancellationMessage["toolCallCancellation"] =>
   typeof a === "object" && Array.isArray((a as any).ids);
+
+export interface GoogleSearchPart {
+  googleSearch: {
+    results: Array<{
+      title: string;
+      url: string;
+      snippet: string;
+    }>;
+  };
+}
+
+export interface ContentPart {
+  text?: string;
+  googleSearch?: GoogleSearchPart['googleSearch'];
+}
