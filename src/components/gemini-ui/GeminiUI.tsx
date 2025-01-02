@@ -89,7 +89,6 @@ interface StructureMetadata {
 interface Position {
   x: number;
   y: number;
-  z: number;
 }
 
 // Add these interfaces
@@ -159,7 +158,7 @@ export const GeminiUI: React.FC = () => {
   const [audioLevel, setAudioLevel] = useState(0);
   const [isConnecting, setIsConnecting] = useState(false);
 
-  const { position: mediaPosition, isDragging: mediaIsDragging, snappedEdge } = useDraggable(
+  const { position: mediaPosition, isDragging: mediaIsDragging, snappedEdge, setPosition: setMediaPosition } = useDraggable(
     mediaControlsRef,
     { x: window.innerWidth / 2 - 200, y: window.innerHeight - 100 },
     20
@@ -683,6 +682,9 @@ export const GeminiUI: React.FC = () => {
       // Wait for 3Dmol to be loaded
       await ensure3DmolLoaded();
       
+      // Wait for the container to be ready
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
       const container = document.getElementById('viewer-container');
       if (!container) {
         throw new Error('Viewer container not found');
@@ -701,16 +703,28 @@ export const GeminiUI: React.FC = () => {
       };
 
       console.log('Creating viewer with config:', config);
-      const viewer = (window as any).$3Dmol.createViewer(container, config);
       
+      // Create viewer and wait for it to be ready
+      const viewer = (window as any).$3Dmol.createViewer(container, config);
       if (!viewer) {
         throw new Error('Failed to create 3DMol viewer');
       }
 
+      // Wait for viewer to be fully initialized
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       // Set initial view parameters
       viewer.setBackgroundColor('black');
       viewer.setStyle({}, { cartoon: { color: 'spectrum' } });
-      viewer.render();
+      
+      // Ensure the viewer is ready before rendering
+      try {
+        viewer.render();
+      } catch (renderError) {
+        console.warn('Initial render failed, retrying...', renderError);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        viewer.render();
+      }
       
       viewer3DRef.current = viewer;
       console.log('3DMol viewer initialized successfully');
@@ -1680,12 +1694,21 @@ export const GeminiUI: React.FC = () => {
       }
       
       // First zoom out slightly to provide context
-      viewer3D.zoomTo();
+      try {
+        viewer3D.zoomTo();
+      } catch (error) {
+        console.warn('Initial zoom failed, retrying...', error);
+      }
       
       // Then zoom to the selected residue with animation
-      setTimeout(() => {
-        viewer3D.zoomTo({ resi: residuePosition }, 1000);
-        viewer3D.render();
+      setTimeout(async () => {
+        try {
+          viewer3D.zoomTo({ resi: residuePosition }, 1000);
+          await new Promise(resolve => setTimeout(resolve, 50));
+          viewer3D.render();
+        } catch (error) {
+          console.error('Error during zoom animation:', error);
+        }
       }, 100);
       
     } catch (error) {
@@ -1724,6 +1747,31 @@ export const GeminiUI: React.FC = () => {
     }
     
     viewer3D.render();
+  };
+
+  // Add state for controls expansion
+  const [areControlsExpanded, setAreControlsExpanded] = useState(false);
+
+  const [controlsPanelSize, setControlsPanelSize] = useState({ width: 0, height: 0 });
+  const controlsPanelRef = useRef<HTMLDivElement>(null);
+
+  // Add this function to handle panel expansion/collapse
+  const handlePanelToggle = () => {
+    if (controlsPanelRef.current) {
+      const rect = controlsPanelRef.current.getBoundingClientRect();
+      const currentHeight = rect.height;
+      
+      // If we're collapsing, adjust the position to keep the panel centered on the cursor
+      if (areControlsExpanded) {
+        const newHeight = 64; // Approximate height of collapsed panel
+        const heightDiff = currentHeight - newHeight;
+        setMediaPosition({
+          x: mediaPosition.x,
+          y: mediaPosition.y + (heightDiff / 2)
+        });
+      }
+    }
+    setAreControlsExpanded(!areControlsExpanded);
   };
 
   return (
@@ -1861,92 +1909,58 @@ export const GeminiUI: React.FC = () => {
         ref={mediaControlsRef}
         className={cn("floating-controls", {
           dragging: mediaIsDragging,
+          expanded: areControlsExpanded,
           [`snap-${snappedEdge?.position}`]: snappedEdge !== null
         })}
         style={{
           position: 'fixed',
           transform: `translate(${mediaPosition.x}px, ${mediaPosition.y}px)`,
-          cursor: mediaIsDragging ? 'grabbing' : 'grab'
+          cursor: mediaIsDragging ? 'grabbing' : 'grab',
+          transition: mediaIsDragging ? 'none' : 'transform 0.3s ease'
         }}
       >
-        <div className="controls-section pdb-controls">
-          <div className="pdb-input">
-            <input
-              type="text"
-              value={pdbId}
-              onChange={(e) => setPdbId(e.target.value.toUpperCase())}
-              placeholder="PDB ID"
-              maxLength={4}
-            />
-            <button 
-              className="control-btn"
-              onClick={() => pdbId && loadPdbStructure(pdbId)}
-              title="Load PDB structure"
-            >
-              <i className="fas fa-download"></i>
-            </button>
-          </div>
-          <select
-            className="style-select"
-            value={visualStyle}
-            onChange={(e) => updateVisualizationStyle(e.target.value as any)}
-            title="Visualization style"
-          >
-            <option value="cartoon">Cartoon</option>
-            <option value="surface">Surface</option>
-            <option value="ball-and-stick">Ball & Stick</option>
-            <option value="ribbon">Ribbon</option>
-            <option value="wireframe">Wireframe</option>
-          </select>
-          <select
-            className="style-select"
-            value={colorScheme}
-            onChange={(e) => updateColorScheme(e.target.value as any)}
-            title="Color scheme"
-          >
-            <option value="spectrum">Spectrum</option>
-            <option value="chainid">Chain</option>
-            <option value="residue">Residue</option>
-            <option value="secondary-structure">Secondary Structure</option>
-            <option value="element">Element</option>
-          </select>
-          <button 
-            className={cn('control-btn', { active: showLabels })}
-            onClick={toggleLabels}
-            title={showLabels ? 'Hide labels' : 'Show labels'}
-          >
-            <i className="fas fa-tag"></i>
-          </button>
-          <button 
-            className="control-btn"
-            onClick={() => stage?.autoView()}
-            title="Reset NGL view"
-          >
-            <i className="fas fa-arrows-rotate"></i>
-          </button>
-          <button 
-            className="control-btn"
-            onClick={() => {
-              const viewer = threeDMolRef.current?.viewer;
-              if (viewer) viewer.zoomTo();
-            }}
-            title="Reset 3DMol view"
-          >
-            <i className="fas fa-arrows-rotate"></i>
-          </button>
-          <button 
-            className="control-btn"
-            onClick={() => stage?.toggleFullscreen()}
-            title="Toggle fullscreen"
-          >
-            <i className="fas fa-expand"></i>
-          </button>
-        </div>
+        <button
+          className="expand-toggle"
+          onClick={handlePanelToggle}
+          title={areControlsExpanded ? "Show less" : "Show more"}
+          style={{ 
+            position: 'absolute',
+            top: '-24px',
+            right: '12px',
+            width: '38px',
+            height: '24px',
+            borderBottomLeftRadius: '0px',
+            borderBottomRightRadius: '0px',
+            borderTopLeftRadius: '8px',
+            borderTopRightRadius: '8px',
+            backgroundColor: '#1e1b4b',
+            border: 'none',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          <i className={`fas fa-chevron-${areControlsExpanded ? 'down' : 'up'}`}></i>
+        </button>
 
-        <div className="controls-divider" />
+        <div 
+          className="panel-drag-handle"
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            height: '24px',
+            cursor: 'grab',
+            backgroundColor: 'transparent',
+            borderTopLeftRadius: '8px',
+            borderTopRightRadius: '8px'
+          }}
+        />
 
-        {/* Media Controls */}
-        <div className="controls-section media-controls">
+        {/* Media Controls - Always visible */}
+        <div className="controls-section media-controls" style={{ marginTop: '5px' }}>
           <button
             className={cn('control-btn', { active: isStreaming })}
             onClick={isStreaming ? stopAudioRecording : startAudioRecording}
@@ -1981,7 +1995,85 @@ export const GeminiUI: React.FC = () => {
           </button>
         </div>
 
-        <div className="drag-handle"></div>
+        {areControlsExpanded && (
+          <>
+            <div className="controls-divider" />
+            
+            <div className="controls-section pdb-controls">
+              <div className="pdb-input">
+                <input
+                  type="text"
+                  value={pdbId}
+                  onChange={(e) => setPdbId(e.target.value.toUpperCase())}
+                  placeholder="PDB ID"
+                  maxLength={4}
+                />
+                <button 
+                  className="control-btn"
+                  onClick={() => pdbId && loadPdbStructure(pdbId)}
+                  title="Load PDB structure"
+                >
+                  <i className="fas fa-download"></i>
+                </button>
+              </div>
+              <select
+                className="style-select"
+                value={visualStyle}
+                onChange={(e) => updateVisualizationStyle(e.target.value as any)}
+                title="Visualization style"
+              >
+                <option value="cartoon">Cartoon</option>
+                <option value="surface">Surface</option>
+                <option value="ball-and-stick">Ball & Stick</option>
+                <option value="ribbon">Ribbon</option>
+                <option value="wireframe">Wireframe</option>
+              </select>
+              <select
+                className="style-select"
+                value={colorScheme}
+                onChange={(e) => updateColorScheme(e.target.value as any)}
+                title="Color scheme"
+              >
+                <option value="spectrum">Spectrum</option>
+                <option value="chainid">Chain</option>
+                <option value="residue">Residue</option>
+                <option value="secondary-structure">Secondary Structure</option>
+                <option value="element">Element</option>
+              </select>
+              <button 
+                className={cn('control-btn', { active: showLabels })}
+                onClick={toggleLabels}
+                title={showLabels ? 'Hide labels' : 'Show labels'}
+              >
+                <i className="fas fa-tag"></i>
+              </button>
+              {/* <button 
+                className="control-btn"
+                onClick={() => stage?.autoView()}
+                title="Reset NGL view"
+              >
+                <i className="fas fa-arrows-rotate"></i>
+              </button>
+              <button 
+                className="control-btn"
+                onClick={() => {
+                  const viewer = threeDMolRef.current?.viewer;
+                  if (viewer) viewer.zoomTo();
+                }}
+                title="Reset 3DMol view"
+              >
+                <i className="fas fa-arrows-rotate"></i>
+              </button> */}
+              <button 
+                className="control-btn"
+                onClick={() => stage?.toggleFullscreen()}
+                title="Toggle fullscreen"
+              >
+                <i className="fas fa-expand"></i>
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
       <div 

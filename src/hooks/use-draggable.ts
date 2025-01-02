@@ -117,5 +117,5 @@ export const useDraggable = (
     };
   }, [elementRef, isDragging, snapThreshold]);
 
-  return { position, isDragging, snappedEdge };
+  return { position, isDragging, snappedEdge, setPosition };
 }; 
