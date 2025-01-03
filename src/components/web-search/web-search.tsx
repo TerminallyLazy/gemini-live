@@ -38,15 +38,14 @@ const WebSearchComponent = () => {
   useEffect(() => {
     setConfig({
       model: "models/gemini-2.0-flash-exp", // Or your preferred Gemini model
-      // ... other config options (generationConfig, systemInstruction, etc.)
-
-      tools: [
-        // Enable the built-in Google Search tool
-        { googleSearch: {} },
-        // Include the web_search function declaration
-        { functionDeclarations: [searchDeclaration] },
-      ],
-    });
+      generationConfig: {
+        responseModalities: ["TEXT"],
+      },
+      tools: [{
+        functionDeclarations: [searchDeclaration]
+      }],
+      
+    }); 
   }, [setConfig]);
 
   useEffect(() => {
@@ -81,11 +80,12 @@ const WebSearchComponent = () => {
       }
     };
 
-    client.on("toolcall", onToolCall);
-
-    return () => {
-      client.off("toolcall", onToolCall);
-    };
+    if (client) {
+      client.on("toolcall", onToolCall);
+      return () => {
+        client.off("toolcall", onToolCall);
+      };
+    }
   }, [client]);
 
   useEffect(() => {
@@ -97,7 +97,7 @@ const WebSearchComponent = () => {
             Array.isArray((part as GoogleSearchPart).googleSearch?.results)
         );
   
-        if (resultsPart) {
+        if (resultsPart && client) {
           const results: SearchResult[] = resultsPart.googleSearch.results.map(
             (r: any) => ({
               title: r.title,
@@ -123,11 +123,12 @@ const WebSearchComponent = () => {
       }
     };
 
-    client.on("content", onContent);
-    
-    return () => {
-      client.off("content", onContent);
-    };
+    if (client) {
+      client.on("content", onContent);
+      return () => {
+        client.off("content", onContent);
+      };
+    }
   }, [client]);
 
   // 3. Display or Use the Search Results

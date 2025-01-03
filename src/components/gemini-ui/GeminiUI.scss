@@ -562,17 +562,20 @@
       background: rgba(139, 92, 246, 0.05);
 
       .status-indicator {
-        width: 8px;
-        height: 8px;
+        width: 10px;
+        height: 10px;
         border-radius: 50%;
-        background: var(--error);
-        box-shadow: 0 0 10px var(--error);
+        margin-right: 8px;
+        
+        &.connected { background-color: #4CAF50; }
+        &.connecting { background-color: #FFC107; }
+        &.error { background-color: #F44336; }
+        &.disconnected { background-color: #9E9E9E; }
+      }
 
-        &.status-connected {
-          background: var(--success);
-          box-shadow: 0 0 10px var(--success);
-          animation: pulse 2s infinite;
-        }
+      .status-text {
+        margin-right: 8px;
+        font-size: 14px;
       }
 
       .connect-btn {

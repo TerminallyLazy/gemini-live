@@ -259,8 +259,12 @@ class AudioLoop:
         while True:
             msg = await self.out_queue.get()
             logger.debug("Sending realtime data to session.")
-            await self.session.send(msg)
-            logger.debug("Data sent.")
+            
+            # Extract end_of_turn flag if present, default to False
+            end_of_turn = msg.pop("end_of_turn", False) if isinstance(msg, dict) else False
+            
+            await self.session.send(msg, end_of_turn=end_of_turn)
+            logger.debug(f"Data sent with end_of_turn={end_of_turn}")
 
     async def listen_audio(self):
         """
@@ -286,10 +290,36 @@ class AudioLoop:
             kwargs = {"exception_on_overflow": False}
         else:
             kwargs = {}
+
+        silence_threshold = 500  # Number of silent chunks before considering end of speech
+        silence_counter = 0
+        is_speaking = False
+
         while True:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
-            logger.debug("Audio chunk queued for sending.")
+            
+            # Simple silence detection (you may want to implement a more sophisticated VAD)
+            is_silent = max(abs(x) for x in data) < 100
+            
+            if is_silent:
+                silence_counter += 1
+            else:
+                silence_counter = 0
+                is_speaking = True
+
+            # Send audio chunk with appropriate end_of_turn flag
+            if is_speaking:
+                end_of_turn = silence_counter >= silence_threshold
+                await self.out_queue.put({
+                    "data": data, 
+                    "mime_type": "audio/pcm",
+                    "end_of_turn": end_of_turn
+                })
+                logger.debug(f"Audio chunk queued for sending (end_of_turn: {end_of_turn})")
+                
+                if end_of_turn:
+                    is_speaking = False
+                    silence_counter = 0
 
     async def receive_audio(self):
         """

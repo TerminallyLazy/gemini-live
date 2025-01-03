@@ -144,12 +144,14 @@ function ControlTray({
 
   useEffect(() => {
     const onData = (base64: string) => {
-      client.sendRealtimeInput([
-        {
-          mimeType: "audio/pcm;rate=16000",
-          data: base64,
-        },
-      ]);
+      if (client) {
+        client.sendRealtimeInput([
+          {
+            mimeType: "audio/pcm;rate=16000",
+            data: base64,
+          },
+        ]);
+      }
     };
     if (connected && !muted && audioRecorder) {
       audioRecorder.on("data", onData).on("volume", setInVolume).start();
@@ -183,7 +185,9 @@ function ControlTray({
         ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
         const base64 = canvas.toDataURL("image/jpeg", 1.0);
         const data = base64.slice(base64.indexOf(",") + 1, Infinity);
-        client.sendRealtimeInput([{ mimeType: "image/jpeg", data }]);
+        if (client) {
+          client.sendRealtimeInput([{ mimeType: "image/jpeg", data }]);
+        }
       }
       if (connected) {
         timeoutId = window.setTimeout(sendVideoFrame, 1000 / 0.5);

@@ -22,7 +22,7 @@ import {
 export class AudioStreamer {
   public audioQueue: Float32Array[] = [];
   private isPlaying: boolean = false;
-  private sampleRate: number = 24000;
+  private sampleRate: number;
   private bufferSize: number = 7680;
   private processingBuffer: Float32Array = new Float32Array(0);
   private scheduledTime: number = 0;
@@ -36,10 +36,12 @@ export class AudioStreamer {
   public onComplete = () => {};
 
   constructor(public context: AudioContext) {
+    this.sampleRate = context.sampleRate;
     this.gainNode = this.context.createGain();
     this.source = this.context.createBufferSource();
     this.gainNode.connect(this.context.destination);
     this.addPCM16 = this.addPCM16.bind(this);
+    console.log('AudioStreamer initialized with sample rate:', this.sampleRate);
   }
 
   async addWorklet<T extends (d: any) => void>(

@@ -37,6 +37,8 @@ interface MultimodalLiveClientEventTypes {
   turncomplete: () => void;
   toolcall: (toolCall: ToolCall) => void;
   toolcallcancellation: (toolcallCancellation: ToolCallCancellation) => void;
+  error: (error: Error) => void;
+  message: (data: any) => void;
 }
 
 export type MultimodalLiveAPIClientConnection = {
@@ -53,15 +55,21 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
   public ws: WebSocket | null = null;
   protected config: LiveConfig | null = null;
   public url: string = "";
-  public getConfig() {
-    return { ...this.config };
-  }
+  private setupPromiseResolve: (() => void) | null = null;
+  private setupPromiseReject: ((error: Error) => void) | null = null;
+
+  private connectionAttempts = 0;
+  private maxRetries = 3;
+  private retryDelay = 1000;
+  private isConnecting = false;
+  setupTimeout: any;
 
   constructor({ url, apiKey }: MultimodalLiveAPIClientConnection) {
     super();
+    const host = 'generativelanguage.googleapis.com';
     url =
       url ||
-      `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent`;
+      `wss://${host}/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent`;
     url += `?key=${apiKey}`;
     this.url = url;
     this.send = this.send.bind(this);
@@ -77,73 +85,158 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     const log: StreamingLog = {
       date: new Date(),
       type,
-      message,
+      message: typeof message === 'string' ? message : JSON.stringify(message)
     };
-    if (data) {
-      (log.message as any).data = data;
+
+    // Only add data if it exists and message is an object
+    if (data !== undefined) {
+      try {
+        const messageObj = typeof message === 'string' ? { text: message } : message;
+        log.message = JSON.stringify({
+          ...messageObj,
+          data
+        });
+      } catch (error) {
+        console.error('Error stringifying log data:', error);
+        // Fallback to just the message if data can't be stringified
+        log.message = typeof message === 'string' ? message : JSON.stringify(message);
+      }
     }
+
     this.emit("log", log);
   }
 
-  connect(config: LiveConfig): Promise<boolean> {
+  async connect(config: LiveConfig): Promise<boolean> {
+    if (this.isConnecting) {
+      this.log('client.warn', 'Connection attempt already in progress');
+      return false;
+    }
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.log('client.warn', 'WebSocket is already connected');
+      return true;
+    }
+
+    this.isConnecting = true;
     this.config = config;
 
-    const ws = new WebSocket(this.url);
-
-    ws.addEventListener("message", async (evt: MessageEvent) => {
-      if (evt.data instanceof Blob) {
-        this.receive(evt.data);
-      } else {
-        console.log("non blob message", evt);
-      }
-    });
     return new Promise((resolve, reject) => {
-      const onError = (ev: Event) => {
-        this.disconnect(ws);
-        const message = `Could not connect to "${this.url}"`;
-        this.log(`server.${ev.type}`, message);
-        reject(new Error(message));
-      };
-      ws.addEventListener("error", onError);
-      ws.addEventListener("open", (ev: Event) => {
-        if (!this.config) {
-          reject("Invalid config sent to `connect(config)`");
+      const tryConnect = () => {
+        if (this.connectionAttempts >= this.maxRetries) {
+          this.isConnecting = false;
+          const error = new Error(`Failed to connect after ${this.maxRetries} attempts`);
+          this.log('client.error', error.message);
+          reject(error);
           return;
         }
-        this.log(`client.${ev.type}`, `connected to socket`);
-        this.emit("open");
 
+        this.connectionAttempts++;
+        this.log('client.info', `Connection attempt ${this.connectionAttempts} of ${this.maxRetries}`);
+        
+        const ws = new WebSocket(this.url);
         this.ws = ws;
 
-        const setupMessage: SetupMessage = {
-          setup: this.config,
+        const cleanup = () => {
+          ws.removeEventListener('error', onError);
+          ws.removeEventListener('open', onOpen);
+          ws.removeEventListener('close', onClose);
         };
-        this._sendDirect(setupMessage);
-        this.log("client.send", "setup");
 
-        ws.removeEventListener("error", onError);
-        ws.addEventListener("close", (ev: CloseEvent) => {
-          console.log(ev);
+        const onError = (ev: Event) => {
+          this.log('client.error', `WebSocket error: ${(ev as ErrorEvent).message || 'Unknown error'}`);
+          cleanup();
           this.disconnect(ws);
-          let reason = ev.reason || "";
-          if (reason.toLowerCase().includes("error")) {
-            const prelude = "ERROR]";
-            const preludeIndex = reason.indexOf(prelude);
-            if (preludeIndex > 0) {
-              reason = reason.slice(
-                preludeIndex + prelude.length + 1,
-                Infinity,
-              );
-            }
+          
+          if (this.connectionAttempts < this.maxRetries) {
+            const delay = this.retryDelay * Math.pow(2, this.connectionAttempts - 1);
+            this.log('client.retry', `Retrying connection in ${delay}ms (attempt ${this.connectionAttempts})`);
+            setTimeout(tryConnect, delay);
+          } else {
+            this.isConnecting = false;
+            reject(new Error('Max retries reached'));
           }
-          this.log(
-            `server.${ev.type}`,
-            `disconnected ${reason ? `with reason: ${reason}` : ``}`,
-          );
-          this.emit("close", ev);
+        };
+
+        const onClose = (ev: CloseEvent) => {
+          this.log('client.close', `WebSocket closed with code ${ev.code}: ${ev.reason || 'No reason provided'}`);
+          cleanup();
+          this.emit('close', ev);
+          
+          if (!this.isConnecting) {
+            return;
+          }
+          
+          if (this.connectionAttempts < this.maxRetries) {
+            const delay = this.retryDelay * Math.pow(2, this.connectionAttempts - 1);
+            setTimeout(tryConnect, delay);
+          } else {
+            this.isConnecting = false;
+            reject(new Error('Max retries reached'));
+          }
+        };
+
+        const onOpen = async () => {
+          this.log('client.open', 'WebSocket connection established');
+          this.emit('open');
+          
+          try {
+            const setupMessage: SetupMessage = {
+              setup: this.config as LiveConfig,
+            };
+            
+            const setupTimeout = setTimeout(() => {
+              this.log('client.error', 'Setup confirmation timeout');
+              ws.close();
+              this.isConnecting = false;
+              reject(new Error('Setup confirmation timeout'));
+            }, 10000);
+
+            const setupHandler = (event: MessageEvent) => {
+              try {
+                const data = JSON.parse(event.data);
+                if (isSetupCompleteMessage(data)) {
+                  this.log('client.setup', 'Received setup complete');
+                  clearTimeout(setupTimeout);
+                  ws.removeEventListener('message', setupHandler);
+                  this.isConnecting = false;
+                  this.connectionAttempts = 0;
+                  resolve(true);
+                }
+              } catch (error) {
+                this.log('client.error', `Failed to parse setup response: ${error}`);
+              }
+            };
+
+            ws.addEventListener('message', setupHandler);
+            
+            this.log('client.setup', 'Sending setup message', setupMessage);
+            this._sendDirect(setupMessage);
+
+          } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            this.log('client.error', `Setup failed: ${errorMessage}`);
+            cleanup();
+            ws.close();
+            this.isConnecting = false;
+            reject(error);
+          }
+        };
+
+        ws.addEventListener('error', onError);
+        ws.addEventListener('open', onOpen);
+        ws.addEventListener('close', onClose);
+        ws.addEventListener('message', (event) => {
+          this.log('server.message', `Received: ${event.data}`);
+          try {
+            const blob = new Blob([event.data]);
+            this.receive(blob);
+          } catch (error) {
+            this.log('client.error', `Failed to process message: ${error}`);
+          }
         });
-        resolve(true);
-      });
+      };
+
+      tryConnect();
     });
   }
 
@@ -151,6 +244,8 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     // could be that this is an old websocket and theres already a new instance
     // only close it if its still the correct reference
     if ((!ws || this.ws === ws) && this.ws) {
+      this.isConnecting = false;
+      this.connectionAttempts = 0;
       this.ws.close();
       this.ws = null;
       this.log("client.close", `Disconnected`);
@@ -158,6 +253,16 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     }
     return false;
   }
+
+  private handleClose = (ev: CloseEvent) => {
+    this.disconnect(undefined); // Pass undefined instead of this.ws to match the parameter type
+    const reason = ev.reason || "";
+    this.log(
+      `server.${ev.type}`,
+      `disconnected ${reason ? `with reason: ${reason}` : ``}`,
+    );
+    this.emit("close", ev);
+  };
 
   protected async receive(blob: Blob) {
     const response: LiveIncomingMessage = (await blobToJSON(
@@ -234,22 +339,34 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
    * send realtimeInput, this is base64 chunks of "audio/pcm" and/or "image/jpg"
    */
   sendRealtimeInput(chunks: GenerativeContentBlob[]) {
-    let hasAudio = false;
-    let hasVideo = false;
-    for (let i = 0; i < chunks.length; i++) {
-      const ch = chunks[i];
-      if (ch.mimeType.includes("audio")) {
-        hasAudio = true;
-      }
-      if (ch.mimeType.includes("image")) {
-        hasVideo = true;
-      }
-      if (hasAudio && hasVideo) {
-        break;
-      }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket connection is not available');
     }
-    const message =
-      hasAudio && hasVideo
+
+    try {
+      let hasAudio = false;
+      let hasVideo = false;
+      for (const chunk of chunks) {
+        if (!chunk || !chunk.mimeType) {
+          throw new Error('Invalid chunk format: missing mimeType');
+        }
+        
+        if (chunk.mimeType.includes("audio")) {
+          hasAudio = true;
+          // Validate audio data
+          if (!chunk.data || typeof chunk.data !== 'string') {
+            throw new Error('Invalid audio data format');
+          }
+        }
+        if (chunk.mimeType.includes("image")) {
+          hasVideo = true;
+        }
+        if (hasAudio && hasVideo) {
+          break;
+        }
+      }
+
+      const message = hasAudio && hasVideo
         ? "audio + video"
         : hasAudio
           ? "audio"
@@ -257,13 +374,20 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
             ? "video"
             : "unknown";
 
-    const data: RealtimeInputMessage = {
-      realtimeInput: {
-        mediaChunks: chunks,
-      },
-    };
-    this._sendDirect(data);
-    this.log(`client.realtimeInput`, message, data);
+      const data: RealtimeInputMessage = {
+        realtimeInput: {
+          mediaChunks: chunks,
+        },
+      };
+
+      this._sendDirect(data);
+      this.log(`client.realtimeInput`, message, data);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error sending audio data';
+      this.emit('error', new Error(errorMessage));
+      this.log('client.error', errorMessage);
+      throw error;
+    }
   }
 
   /**
@@ -303,12 +427,127 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
    *  used internally to send all messages
    *  don't use directly unless trying to send an unsupported message type
    */
-  _sendDirect(request: object) {
-    if (!this.ws) {
-      throw new Error("WebSocket is not connected");
+  _sendDirect(message: any) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket is not connected');
     }
-    const str = JSON.stringify(request);
-    console.log('MultimodalLiveClient _sendDirect:', str);
-    this.ws.send(str);
+    
+    const messageStr = JSON.stringify(message);
+    this.log('client.send', 'Sending message', message);
+    
+    try {
+      this.ws.send(messageStr);
+    } catch (error: unknown) {
+      if (error instanceof Error) {
+        this.log('client.error', `Failed to send message: ${error.message}`);
+      } else {
+        this.log('client.error', 'Failed to send message: Unknown error');
+      }
+      throw error;
+    }
+  }
+
+  private handleMessage(event: MessageEvent) {
+    try {
+      if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+        // Handle binary data (audio)
+        if (event.data instanceof Blob) {
+          event.data.arrayBuffer().then(buffer => {
+            this.emit('audio', buffer);
+          }).catch(error => {
+            this.emit('error', new Error('Failed to process audio data'));
+          });
+        } else {
+          this.emit('audio', event.data);
+        }
+        return;
+      }
+
+      // Handle text/JSON messages
+      let data: any;
+      if (typeof event.data === 'string') {
+        try {
+          data = JSON.parse(event.data);
+        } catch (error) {
+          // If not valid JSON, treat as raw string message
+          data = { type: 'raw', content: event.data };
+        }
+      } else {
+        throw new Error('Unsupported message format');
+      }
+
+      // Process the message based on type
+      if (data.type === 'ready' || data.type === 'config_ack') {
+        this.setupPromiseResolve?.();
+        this.emit('open');
+      } else if (data.error) {
+        this.emit('error', new Error(data.error.message || 'Server error'));
+      } else {
+        this.emit('message', data);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error processing message';
+      this.emit('error', new Error(errorMessage));
+      console.error('Error handling message:', error);
+    }
+  }
+
+  private setupHandler(event: MessageEvent) {
+    try {
+      // Log the raw message for debugging
+      console.log('Raw setup response:', event.data);
+      
+      // Try to parse as JSON, but first check if it's a string
+      let response;
+      if (typeof event.data === 'string') {
+        // Remove any BOM or whitespace
+        const cleanData = event.data.trim().replace(/^\uFEFF/, '');
+        try {
+          response = JSON.parse(cleanData);
+        } catch (e) {
+          throw new Error(`Failed to parse setup response: ${e}\nRaw data: ${cleanData}`);
+        }
+      } else {
+        response = event.data;
+      }
+
+      // Log parsed response
+      console.log('Parsed setup response:', response);
+
+      if (response?.type === 'setup_complete') {
+        // Clear timeout and resolve setup promise
+        if (this.setupTimeout) {
+          clearTimeout(this.setupTimeout);
+          this.setupTimeout = null;
+        }
+        this.setupPromiseResolve?.();
+      } else {
+        throw new Error(`Invalid setup response: ${JSON.stringify(response)}`);
+      }
+    } catch (error) {
+      console.error('Setup handler error:', error);
+      this.setupPromiseReject?.(error as Error);
+    }
+  }
+
+  private sendInitialConfig() {
+    try {
+      const initialMessage = {
+        type: 'setup',
+        config: this.config
+      };
+
+      // Log what we're sending
+      console.log('Sending initial config:', JSON.stringify(initialMessage, null, 2));
+      
+      if (this.ws) {
+        this.ws.send(JSON.stringify(initialMessage));
+      } else {
+        throw new Error('WebSocket connection not initialized');
+      }
+    } catch (error) {
+      console.error('Error sending initial config:', error);
+      this.setupPromiseReject?.(error as Error);
+    }
   }
 }

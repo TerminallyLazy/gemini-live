@@ -17,6 +17,7 @@
 import type {
   Content,
   FunctionCall,
+  FunctionDeclaration,
   GenerationConfig,
   GenerativeContentBlob,
   Part,
@@ -34,21 +35,44 @@ import type {
 /**
  * the config to initiate the session
  */
-export type LiveConfig = {
+export interface LiveConfig {
   model: string;
-  systemInstruction?: { parts: Part[] };
-  generationConfig?: Partial<LiveGenerationConfig>;
-  tools?: Array<Tool | { googleSearch: {} } | { codeExecution: {} }>;
-};
-
-export type LiveGenerationConfig = GenerationConfig & {
-  responseModalities: "text" | "audio" | "image";
-  speechConfig?: {
-    voiceConfig?: {
-      prebuiltVoiceConfig?: {
-        voiceName: "Puck" | "Charon" | "Kore" | "Fenrir" | "Aoede" | string;
+  generationConfig: {
+    responseModalities: string[];
+    speechConfig?: {
+      voiceConfig: {
+        prebuiltVoiceConfig: {
+          voiceName: string;
+        };
       };
     };
+  };
+  systemInstruction?: {
+    parts: Part[];
+  };
+  tools?: Array<{
+    functionDeclarations?: FunctionDeclaration[];
+    googleSearch?: Record<string, never>;
+  }>;
+  audioInputConfig?: {
+    encoding: string;
+    sampleRateHertz: number;
+    languageCode: string;
+  };
+}
+
+export type LiveGenerationConfig = GenerationConfig & {
+  response_modalities: ("TEXT" | "AUDIO" | "IMAGE")[];
+  speech_config?: {
+    voice_config?: {
+      prebuilt_voice_config?: {
+        voice_name: "Puck" | "Charon" | "Kore" | "Fenrir" | "Aoede" | string;
+      };
+    };
+  };
+  audio_in_config?: {
+    sample_rate_hz: number;
+    language_code: string;
   };
 };
 

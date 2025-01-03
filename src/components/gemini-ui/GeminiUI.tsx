@@ -1,12 +1,15 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useLiveAPIContext } from '../../contexts/LiveAPIContext';
 import { LiveConfig } from '../../multimodal-live-types';
+import { Part } from '@google/generative-ai';
 import cn from 'classnames';
 import { useDraggable } from '../../hooks/use-draggable';
 import './GeminiUI.scss';
 import { MultimodalLiveClient } from '../../lib/multimodal-live-client';
 import { Stage, Selection, Vector3 } from 'ngl';
 import { SNPViewer } from '../snp-viewer/SNPViewer';
+import { GEMINI_CONFIG } from '../../config/gemini-config';
+import { AudioRecorder } from '../../lib/audio-recorder';
 
 // Declare the global 3Dmol object
 declare global {
@@ -107,6 +110,38 @@ declare var ImageCapture: {
   new(track: MediaStreamTrack): ImageCapture;
 };
 
+// Add these constants at the top of the component
+const CONNECTION_TIMEOUT = 15000; // 15 seconds
+const SETUP_RETRY_DELAY = 1000; // 1 second
+const MAX_SETUP_RETRIES = 3;
+
+// Add these utility functions at the top of the file
+const logAudioData = (data: ArrayBuffer, label: string) => {
+  const view = new Uint8Array(data);
+  console.log(`${label} (first 10 bytes):`, Array.from(view.slice(0, 10)));
+  console.log(`${label} total bytes:`, data.byteLength);
+};
+
+// Add this function near the top with other utility functions
+const createAudioContext = () => {
+  try {
+    // Fix for Firefox - create audio context with lower sample rate
+    return new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 44100, // Use standard sample rate
+      latencyHint: 'interactive'
+    });
+  } catch (error) {
+    console.error('Failed to create AudioContext:', error);
+    return null;
+  }
+};
+
+// Add new types for transcription
+interface TranscriptionResult {
+  text: string;
+  confidence?: number;
+}
+
 export const GeminiUI: React.FC = () => {
   // Context
   const { client, connected, connect, disconnect, setConfig } = useLiveAPIContext() as LiveAPIContext;
@@ -127,6 +162,7 @@ export const GeminiUI: React.FC = () => {
   const [snps, setSnps] = useState<SNP[]>([]);
   const [structureMetadata, setStructureMetadata] = useState<StructureMetadata | null>(null);
   const [selectedSequenceRegion, setSelectedSequenceRegion] = useState<string | null>(null);
+  const [viewerError, setViewerError] = useState<string | null>(null);
 
   // Refs
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -137,6 +173,16 @@ export const GeminiUI: React.FC = () => {
   const mediaControlsRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
+
+  // Add ref for WebSocket
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Add AudioRecorder ref
+  const audioRecorderRef = useRef<AudioRecorder | null>(null);
+
+  // Add transcription state
+  const [transcription, setTranscription] = useState<string>('');
+  const [isTranscribing, setIsTranscribing] = useState(false);
 
   // Helper functions
   const logEvent = (message: string, isError = false, type: 'system' | 'model' = 'system', sender?: 'user' | 'model') => {
@@ -176,100 +222,379 @@ export const GeminiUI: React.FC = () => {
   const [selectedCodonIndex, setSelectedCodonIndex] = useState<number | null>(null);
   const viewer3DRef = useRef<any>(null);
 
+  const [autoReconnect, setAutoReconnect] = useState(true);
+
+  // Add new state variables for reconnection handling
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const [reconnectTimeout, setReconnectTimeout] = useState<NodeJS.Timeout | null>(null);
+  const MAX_RECONNECT_ATTEMPTS = 5;
+  const RECONNECT_DELAY = 2000; // 2 seconds
+
+  // Add connection state tracking
+  const [connectionState, setConnectionState] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+
+  // Add new state for setup retries
+  const [setupRetries, setSetupRetries] = useState(0);
+  const setupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Add a ref to track if we're in a reconnection cycle
+  const isReconnectingRef = useRef(false);
+
+  // Modify handleConnect to include setup confirmation handling
   const handleConnect = async () => {
-    if (isConnecting) return;
-    
     try {
       setIsConnecting(true);
-      console.log('Attempting to connect to Gemini API...');
+      
+      // Wait for WebSocket to be ready
+      await new Promise((resolve, reject) => {
+        if (!client) {
+          reject(new Error('Client not initialized'));
+          return;
+        }
+
+        const timeout = setTimeout(() => {
+          reject(new Error('Connection timeout'));
+        }, CONNECTION_TIMEOUT);
+
+        client.on('open', () => {
+          clearTimeout(timeout);
+          resolve(true);
+        });
+
+        client.on('error', (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+
       await connect();
-      console.log('Successfully connected to Gemini API');
       logEvent('Connected to Gemini API');
     } catch (error) {
-      console.error('Connection error:', error);
       logEvent('Connection error: ' + (error as Error).message, true);
     } finally {
       setIsConnecting(false);
     }
   };
 
-  const handleDisconnect = async () => {
-    try {
-      if (mediaRecorderRef.current) {
-        await stopAudioRecording();
+  // Add cleanup for setup timeout
+  useEffect(() => {
+    return () => {
+      if (setupTimeoutRef.current) {
+        clearTimeout(setupTimeoutRef.current);
       }
-      if (isScreenSharing) {
-        await toggleScreenShare();
-      }
-      await disconnect();
-      logEvent('Disconnected from Gemini API');
-    } catch (error) {
-      logEvent('Disconnect error: ' + (error as Error).message, true);
-    }
-  };
+    };
+  }, []);
 
+  // Add connection status monitoring
+  useEffect(() => {
+    if (!client) return;
+
+    const handleError = (error: Error) => {
+      console.error('Connection error:', error);
+      logEvent(`Connection error: ${error.message}`, true);
+      setConnectionState('error');
+    };
+
+    const handleDisconnect = () => {
+      console.log('Connection closed');
+      setConnectionState('disconnected');
+      
+      if (autoReconnect && !isReconnectingRef.current) {
+        handleConnect();
+      }
+    };
+
+    // Use log event instead of error
+    client.on('log', (log) => {
+      if (log.type.includes('error')) {
+        handleError(new Error(typeof log.message === 'string' ? log.message : 'Unknown error'));
+      }
+    });
+    client.on('close', handleDisconnect);
+
+    return () => {
+      client.off('log', (log) => {
+        if (log.type.includes('error')) {
+          handleError(new Error(typeof log.message === 'string' ? log.message : 'Unknown error'));
+        }
+      });
+      client.off('close', handleDisconnect);
+    };
+  }, [client, autoReconnect, handleConnect]);
+
+  const handleDisconnect = useCallback(() => {
+    console.log('Manually disconnecting...');
+    setAutoReconnect(false);
+    isReconnectingRef.current = false;
+    setIsConnecting(false);
+    setConnectionState('disconnected');
+    
+    // Clear any pending timeouts
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout);
+      setReconnectTimeout(null);
+    }
+    if (setupTimeoutRef.current) {
+      clearTimeout(setupTimeoutRef.current);
+      setupTimeoutRef.current = null;
+    }
+    
+    disconnect();
+    setReconnectAttempts(0);
+    setSetupRetries(0);
+    logEvent('Disconnected from Gemini API');
+  }, [disconnect, reconnectTimeout]);
+
+  // Add event listener cleanup for client events
+  useEffect(() => {
+    if (!client) return;
+
+    const handleContent = (content: any) => {
+      console.log('Received content from model:', content);
+      if (content.modelTurn?.parts) {
+        content.modelTurn.parts.forEach((part: any) => {
+          if (part.text) {
+            console.log('Model response text:', part.text);
+            logEvent(part.text, false, 'model', 'model');
+          }
+        });
+      }
+    };
+
+    const handleAudio = (data: ArrayBuffer) => {
+      // Handle audio data
+    };
+
+    client.on('content', handleContent);
+    client.on('audio', handleAudio);
+
+    return () => {
+      client.off('content', handleContent);
+      client.off('audio', handleAudio);
+    };
+  }, [client]); // Only re-run if client changes
+
+  // Add WebSocket binary type setup to connection handling
+  useEffect(() => {
+    if (!client) return;
+
+    // Access the underlying WebSocket if available
+    const ws = (client as any).ws;
+    if (ws) {
+      ws.binaryType = 'arraybuffer'; // Change to arraybuffer for direct audio processing
+      wsRef.current = ws;
+      
+      // Add binary message handler
+      ws.onmessage = async (event: MessageEvent) => {
+        try {
+          if (event.data instanceof ArrayBuffer) {
+            logAudioData(event.data, 'Received audio buffer');
+            if (modelAudioEnabled) {
+              // Process audio data...
+              const audioContext = audioContextRef.current || new (window.AudioContext || window.webkitAudioContext)();
+              const audioBuffer = await audioContext.decodeAudioData(event.data);
+              const source = audioContext.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(audioContext.destination);
+              source.start();
+            }
+          }
+        } catch (error) {
+          console.error('Error processing audio message:', error);
+          logEvent('Error processing audio: ' + (error as Error).message, true);
+        }
+      };
+    }
+
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.onmessage = null;
+      }
+    };
+  }, [client, modelAudioEnabled]);
+
+  // Initialize both viewers with better error handling
+  useEffect(() => {
+    const initViewers = async () => {
+      if (!viewerRef.current) return;
+
+      try {
+        // Initialize NGL viewer
+        const newStage = new Stage(viewerRef.current, {
+          backgroundColor: '#000000',
+          quality: 'high',
+          impostor: true,
+          rotateSpeed: 2.0,
+          zoomSpeed: 1.2,
+          panSpeed: 1.0,
+          lightIntensity: 1.5,
+          ambientIntensity: 0.8,
+          workerDefault: true,
+          sampleLevel: 1
+        });
+        setStage(newStage);
+
+        // Initialize 3DMol viewer after ensuring it's loaded
+        await ensure3DmolLoaded();
+        const viewer = await init3DMolViewer();
+        if (viewer) {
+          viewer3DRef.current = viewer;
+          logEvent('3DMol viewer initialized successfully');
+        } else {
+          throw new Error('Failed to initialize 3DMol viewer');
+        }
+      } catch (error) {
+        console.error('Error initializing viewers:', error);
+        logEvent('Failed to initialize viewers: ' + (error as Error).message, true);
+      }
+    };
+
+    initViewers();
+
+    return () => {
+      if (stage) {
+        try {
+          stage.dispose();
+        } catch (error) {
+          console.error('Error disposing stage:', error);
+        }
+      }
+      if (viewer3DRef.current) {
+        try {
+          viewer3DRef.current.clear();
+        } catch (error) {
+          console.error('Error clearing 3DMol viewer:', error);
+        }
+      }
+    };
+  }, []);
+
+  // Modify audio processing setup
+  const setupAudioProcessing = useCallback(() => {
+    try {
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        const newContext = createAudioContext();
+        if (!newContext) {
+          throw new Error('Could not create AudioContext');
+        }
+        audioContextRef.current = newContext;
+      }
+
+      // Resume the audio context if it's in suspended state
+      if (audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().catch(console.error);
+      }
+
+      const audioContext = audioContextRef.current;
+      console.log('AudioContext sample rate:', audioContext.sampleRate);
+
+      // Create processor with optimal buffer size for Firefox
+      const bufferSize = 4096; // Increased buffer size for better Firefox compatibility
+      const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+      
+      let resampleBuffer: number[] = [];
+      let lastSampleTime = 0;
+      
+      processor.onaudioprocess = (e) => {
+        if (!isStreaming || !client || client.ws?.readyState !== WebSocket.OPEN) return;
+        
+        try {
+          const inputData = e.inputBuffer.getChannelData(0);
+          
+          // Resample to 16kHz using linear interpolation
+          for (let i = 0; i < inputData.length; i++) {
+            const sampleTime = i / audioContext.sampleRate;
+            const targetSampleTime = lastSampleTime + (1 / 16000);
+            
+            if (sampleTime >= targetSampleTime) {
+              const prevSample = i > 0 ? inputData[i - 1] : inputData[i];
+              const t = (targetSampleTime - (i - 1) / audioContext.sampleRate) * audioContext.sampleRate;
+              const sample = prevSample + (inputData[i] - prevSample) * t;
+              
+              resampleBuffer.push(sample);
+              lastSampleTime = targetSampleTime;
+              
+              if (resampleBuffer.length >= 1024) {
+                // Convert to Int16 PCM
+                const pcmData = new Int16Array(resampleBuffer.length);
+                for (let j = 0; j < resampleBuffer.length; j++) {
+                  pcmData[j] = Math.max(-32768, Math.min(32767, Math.floor(resampleBuffer[j] * 32768)));
+                }
+                
+                try {
+                  const base64Data = arrayBufferToBase64(pcmData.buffer);
+                  const part: Part = {
+                    inlineData: {
+                      mimeType: 'audio/wav;rate=16000',
+                      data: base64Data
+                    }
+                  };
+                  client.send([part], false);
+                  
+                  // Calculate audio level
+                  let sum = 0;
+                  for (let j = 0; j < resampleBuffer.length; j++) {
+                    sum += Math.abs(resampleBuffer[j]);
+                  }
+                  setAudioLevel(sum / resampleBuffer.length * 100);
+                } catch (error) {
+                  console.error('Error sending audio chunk:', error);
+                }
+                
+                resampleBuffer = [];
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Error processing audio:', error);
+        }
+      };
+
+      return processor;
+    } catch (error) {
+      console.error('Error setting up audio processing:', error);
+      throw error;
+    }
+  }, [isStreaming, client]);
+
+  // Replace the old audio recording implementation with the new one
   const startAudioRecording = async () => {
     try {
       if (!connected) {
+        console.error('Cannot start recording: Not connected');
         logEvent('Cannot start recording: Not connected', true);
         return;
       }
 
-      // Create AudioContext first to get its sample rate
-      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
+      // Create an instance of AudioRecorder with 16kHz sample rate (required for speech recognition)
+      const recorder = new AudioRecorder(16000);
+      audioRecorderRef.current = recorder;
 
-      const audioContext = audioContextRef.current;
-      const contextSampleRate = audioContext.sampleRate;
+      setIsTranscribing(true);
+      setTranscription(''); // Clear previous transcription
 
-      // Get audio stream matching the AudioContext's sample rate
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          channelCount: 1,
-          sampleRate: contextSampleRate,  // Use AudioContext's sample rate
-          autoGainControl: true
+      // Listen for audio data chunks
+      recorder.on('data', (chunk: string) => {
+        if (client && client.ws?.readyState === WebSocket.OPEN) {
+          try {
+            // Send audio for both transcription and model processing
+            client.sendRealtimeInput([{
+              mimeType: 'audio/pcm;rate=16000',
+              data: chunk
+            }]);
+          } catch (error) {
+            console.error('Error sending audio chunk:', error);
+          }
         }
       });
 
-      const source = audioContext.createMediaStreamSource(stream);
-      
-      // Create ScriptProcessor for raw audio data
-      const processor = audioContext.createScriptProcessor(2048, 1, 1);
-      
-      processor.onaudioprocess = (e) => {
-        if (!isStreaming) return;
-        
-        const inputData = e.inputBuffer.getChannelData(0);
-        
-        // Convert Float32Array to Int16Array for PCM
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          pcmData[i] = inputData[i] * 32767;
-        }
-        
-        // Convert to Base64
-        const base64Audio = arrayBufferToBase64(pcmData.buffer);
-        
-        // Send to Gemini API
-        if (client) {
-          client.sendRealtimeInput([{
-            mimeType: 'audio/pcm;rate=16000',  // Specify PCM format
-            data: base64Audio
-          }]);
-        }
-      };
+      // Listen for volume changes to update UI
+      recorder.on('volume', (volume: number) => {
+        setAudioLevel(volume * 100);
+      });
 
-      // Connect the audio processing pipeline
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-      
-      // Store references for cleanup
-      mediaStreamRef.current = stream;
-      processorRef.current = processor;
-      
+      // Start recording
+      await recorder.start();
       setIsStreaming(true);
       logEvent('Started voice input');
 
@@ -277,11 +602,18 @@ export const GeminiUI: React.FC = () => {
       console.error('Error in startAudioRecording:', error);
       logEvent('Error starting voice input: ' + (error as Error).message, true);
       setIsStreaming(false);
+      setIsTranscribing(false);
     }
   };
 
   const stopAudioRecording = () => {
     try {
+      if (audioRecorderRef.current) {
+        audioRecorderRef.current.stop();
+        audioRecorderRef.current = null;
+      }
+
+      // Clean up old audio context and processor if they exist
       if (processorRef.current) {
         processorRef.current.disconnect();
         processorRef.current = null;
@@ -292,12 +624,34 @@ export const GeminiUI: React.FC = () => {
         mediaStreamRef.current = null;
       }
 
+      // Send turn completion to get model's response
+      if (client) {
+        try {
+          // Send turn completion with transcription as text
+          client.send([{ text: transcription }], true);
+        } catch (error) {
+          console.error('Error sending turn completion:', error);
+        }
+      }
+
       setIsStreaming(false);
+      setIsTranscribing(false);
       logEvent('Stopped audio recording');
     } catch (error) {
+      console.error('Error in stopAudioRecording:', error);
       logEvent('Error stopping audio recording: ' + (error as Error).message, true);
     }
   };
+
+  // Clean up audio recorder on unmount
+  useEffect(() => {
+    return () => {
+      if (audioRecorderRef.current) {
+        audioRecorderRef.current.stop();
+        audioRecorderRef.current = null;
+      }
+    };
+  }, []);
 
   const toggleScreenShare = async () => {
     try {
@@ -501,100 +855,6 @@ export const GeminiUI: React.FC = () => {
     }
   };
 
-  useEffect(() => {
-    console.log('Setting up Gemini config...');
-    setConfig({
-      model: "models/gemini-2.0-flash-exp",
-      generationConfig: {
-        responseModalities: "audio" as "audio" | "text",
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: "Puck"
-            }
-          }
-        }
-      }
-    });
-    console.log('Config set, client state:', client ? 'present' : 'null');
-
-    // Attempt to connect automatically
-    handleConnect();
-  }, [setConfig, client]);
-
-  useEffect(() => {
-    if (!client) return;
-
-    const handleAudio = async (audioData: ArrayBuffer) => {
-      console.log('Received audio from model:', audioData.byteLength, 'bytes');
-      if (!modelAudioEnabled || isProcessingAudio) return;
-
-      try {
-        // Stop any currently playing audio
-        if (activeSourceRef.current) {
-          try {
-            activeSourceRef.current.stop();
-            activeSourceRef.current.disconnect();
-          } catch (e) {
-            console.log('Error stopping previous audio:', e);
-          }
-        }
-
-        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-          audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        }
-
-        setIsProcessingAudio(true);
-
-        const audioContext = audioContextRef.current;
-        const source = audioContext.createBufferSource();
-        activeSourceRef.current = source;  // Store reference to current source
-
-        // Rest of your audio setup...
-        // ...
-
-        source.onended = () => {
-          setIsProcessingAudio(false);
-          activeSourceRef.current = null;
-          console.log('Finished playing audio response');
-        };
-      } catch (error) {
-        console.error('Audio processing error:', error);
-        setIsProcessingAudio(false);
-        activeSourceRef.current = null;
-      }
-    };
-
-    const handleContent = (content: any) => {
-      console.log('Received content from model:', content);
-      if (content.modelTurn?.parts) {
-        content.modelTurn.parts.forEach((part: any) => {
-          if (part.text) {
-            console.log(`Received: ${part.text}`);
-            const responseArea = document.querySelector('.response-area');
-            if (responseArea) {
-              responseArea.textContent = part.text;
-            }
-
-            // Check for protein structure requests
-            const pdbMatch = part.text.match(/show (?:protein|structure|pdb) (\w{4})/i);
-            if (pdbMatch) {
-              const pdbId = pdbMatch[1].toUpperCase();
-              handleShowProtein(pdbId);
-            }
-          }
-        });
-      }
-    };
-
-    client.on('content', handleContent);
-    client.on('audio', handleAudio);
-
-    return () => {
-      client.off('content', handleContent);
-      client.off('audio', handleAudio);
-    };
-  }, [client, isProcessingAudio]);
   const sendMessage = () => {
     if (connected && inputText?.trim()) {
       client?.send([{ text: inputText }]);
@@ -611,51 +871,6 @@ export const GeminiUI: React.FC = () => {
     }
     return window.btoa(binary);
   };
-
-  // Initialize both viewers
-  useEffect(() => {
-    const initViewers = async () => {
-      if (!viewerRef.current) return;
-
-      try {
-        // Initialize NGL viewer
-        const newStage = new Stage(viewerRef.current, {
-          backgroundColor: '#000000',
-          quality: 'high',
-          impostor: true,
-          rotateSpeed: 2.0,
-          zoomSpeed: 1.2,
-          panSpeed: 1.0,
-          lightIntensity: 1.5,
-          ambientIntensity: 0.8,
-          workerDefault: true,
-          sampleLevel: 1
-        });
-        setStage(newStage);
-
-        // Initialize 3DMol viewer after a short delay to ensure container is ready
-        setTimeout(async () => {
-          const viewer = await init3DMolViewer();
-          if (viewer) {
-            viewer3DRef.current = viewer;
-            logEvent('3DMol viewer initialized successfully');
-          }
-        }, 100);
-      } catch (error) {
-        console.error('Error initializing viewers:', error);
-        logEvent('Failed to initialize viewers', true);
-      }
-    };
-
-    initViewers();
-
-    return () => {
-      stage?.dispose();
-      if (viewer3DRef.current) {
-        viewer3DRef.current.clear();
-      }
-    };
-  }, []);
 
   // Add this function to check if 3Dmol is loaded
   const ensure3DmolLoaded = (): Promise<void> => {
@@ -1563,6 +1778,64 @@ export const GeminiUI: React.FC = () => {
     );
   };
 
+  // Add state for labels toggle and selected residue
+  const [showLabels, setShowLabels] = useState(true);
+  const [selectedResidue, setSelectedResidue] = useState<number | null>(null);
+
+  const handleSequenceClick = (type: 'dna' | 'rna' | 'protein', index: number, sequence: string) => {
+    const viewer3D = viewer3DRef.current;
+    if (!viewer3D) return;
+    
+    try {
+      const residuePosition = type === 'protein' ? index + 1 : Math.floor(index / 3) + 1;
+      setSelectedCodonIndex(index);
+      setSelectedResidue(residuePosition);
+      
+      viewer3D.setStyle({}, { cartoon: { color: 'spectrum' } });
+      viewer3D.removeAllLabels();
+      
+      const atoms = viewer3D.selectedAtoms({ resi: residuePosition });
+      if (!atoms || atoms.length === 0) {
+        console.error('No atoms found for residue:', residuePosition);
+        return;
+      }
+
+      const atom = atoms.find((a: any) => a.atom === 'CA') || atoms[0];
+      
+      viewer3D.addStyle({ resi: residuePosition }, {
+        cartoon: { color: 'magenta' },
+        stick: { radius: 0.3, color: 'magenta' },
+        sphere: { radius: 0.8, color: 'magenta' }
+      });
+      
+      if (showLabels && atom) {
+        viewer3D.addLabel(`${atom.resn}${residuePosition}`, {
+          position: { x: atom.x, y: atom.y, z: atom.z },
+          backgroundColor: 'rgba(0, 0, 0, 0.8)',
+          fontColor: 'white',
+          fontSize: 14,
+          borderColor: 'magenta',
+          borderThickness: 1.0,
+          inFront: true,
+          showBackground: true
+        });
+      }
+      
+      try {
+        viewer3D.zoomTo();
+        setTimeout(() => {
+          viewer3D.zoomTo({ resi: residuePosition }, 1000);
+          viewer3D.render();
+        }, 100);
+      } catch (error) {
+        console.error('Error during view update:', error);
+      }
+    } catch (error) {
+      console.error('Error updating structure view:', error);
+      logEvent(`Error highlighting residue: ${error}`, true);
+    }
+  };
+
   // Add helper function to chunk sequence into codons
   const chunkIntoCodons = (sequence: string): string[] => {
     const codons: string[] = [];
@@ -1570,6 +1843,60 @@ export const GeminiUI: React.FC = () => {
       codons.push(sequence.slice(i, i + 3));
     }
     return codons;
+  };
+
+  // Add state for controls expansion
+  const [areControlsExpanded, setAreControlsExpanded] = useState(false);
+
+  const [controlsPanelSize, setControlsPanelSize] = useState({ width: 0, height: 0 });
+  const controlsPanelRef = useRef<HTMLDivElement>(null);
+
+  // Add this function to handle panel expansion/collapse
+  const handlePanelToggle = () => {
+    if (controlsPanelRef.current) {
+      const rect = controlsPanelRef.current.getBoundingClientRect();
+      const currentHeight = rect.height;
+      
+      // If we're collapsing, adjust the position to keep the panel centered on the cursor
+      if (areControlsExpanded) {
+        const newHeight = 64; // Approximate height of collapsed panel
+        const heightDiff = currentHeight - newHeight;
+        setMediaPosition({
+          x: mediaPosition.x,
+          y: mediaPosition.y + (heightDiff / 2)
+        });
+      }
+    }
+    setAreControlsExpanded(!areControlsExpanded);
+  };
+
+  const toggleLabels = () => {
+    const newShowLabels = !showLabels;
+    setShowLabels(newShowLabels);
+    
+    const viewer3D = viewer3DRef.current;
+    if (!viewer3D) return;
+
+    viewer3D.removeAllLabels();
+    
+    if (newShowLabels && selectedResidue !== null) {
+      const atoms = viewer3D.selectedAtoms({ resi: selectedResidue });
+      if (atoms && atoms.length > 0) {
+        const atom = atoms.find((a: any) => a.atom === 'CA') || atoms[0];
+        viewer3D.addLabel(`${atom.resn}${selectedResidue}`, {
+          position: { x: atom.x, y: atom.y, z: atom.z },
+          backgroundColor: 'rgba(0, 0, 0, 0.8)',
+          fontColor: 'white',
+          fontSize: 14,
+          borderColor: 'magenta',
+          borderThickness: 1.0,
+          inFront: true,
+          showBackground: true
+        });
+      }
+    }
+    
+    viewer3D.render();
   };
 
   const renderSequenceViewer = () => {
@@ -1638,141 +1965,61 @@ export const GeminiUI: React.FC = () => {
     );
   };
 
-  // Add state for labels toggle and selected residue
-  const [showLabels, setShowLabels] = useState(true);
-  const [selectedResidue, setSelectedResidue] = useState<number | null>(null);
+  // Add error handler for viewer
+  const handleViewerError = useCallback((error: Error) => {
+    console.error('3D viewer error:', error);
+    setViewerError(error.message);
+  }, []);
 
-  const handleSequenceClick = (type: 'dna' | 'rna' | 'protein', index: number, sequence: string) => {
-    const viewer3D = viewer3DRef.current;
-    if (!viewer3D) return;
-    
+  // Add handler for transcription results
+  useEffect(() => {
+    if (!client) return;
+
+    const handleContent = (content: any) => {
+      if (content.modelTurn?.parts) {
+        content.modelTurn.parts.forEach((part: any) => {
+          if (part.text && isTranscribing) {
+            setTranscription(prev => {
+              const newTranscription = prev ? `${prev} ${part.text}` : part.text;
+              logEvent(`Transcription: ${part.text}`, false, 'model');
+              return newTranscription;
+            });
+          }
+          else if (part.text) {
+            logEvent(part.text, false, 'model', 'model');
+          }
+        });
+      }
+    };
+
+    client.on('content', handleContent);
+    return () => { client.off('content', handleContent); };
+  }, [client, isTranscribing, logEvent]);
+
+  // Update the client setup to match the LiveConfig type definition
+  useEffect(() => {
+    if (!client || !setConfig) return;
+
+    const config: LiveConfig = {
+      model: GEMINI_CONFIG.model,
+      generationConfig: {
+        responseModalities: ['TEXT', 'AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: 'Kore'
+            }
+          }
+        }
+      }
+    };
+
     try {
-      // Calculate the corresponding residue position
-      const residuePosition = type === 'protein' ? index + 1 : Math.floor(index / 3) + 1;
-      setSelectedCodonIndex(index);
-      setSelectedResidue(residuePosition);
-      
-      // Reset the view to show the whole structure with default style
-      viewer3D.setStyle({}, { cartoon: { color: 'spectrum' } });
-      viewer3D.removeAllLabels();
-      
-      // Get atoms for the selected residue
-      const atoms = viewer3D.selectedAtoms({ resi: residuePosition });
-      if (!atoms || atoms.length === 0) {
-        console.error('No atoms found for residue:', residuePosition);
-        return;
-      }
-
-      // Get the first alpha carbon atom for the residue
-      const atom = atoms.find((a: any) => a.atom === 'CA') || atoms[0];
-      
-      // Highlight the selected residue
-      viewer3D.addStyle({ resi: residuePosition }, {
-        cartoon: { color: 'magenta' },
-        stick: { 
-          radius: 0.3,
-          color: 'magenta'
-        },
-        sphere: {
-          radius: 0.8,
-          color: 'magenta'
-        }
-      });
-      
-      // Add label for the selected residue if labels are enabled
-      if (showLabels && atom) {
-        viewer3D.addLabel(`${atom.resn}${residuePosition}`, {
-          position: { x: atom.x, y: atom.y, z: atom.z },
-          backgroundColor: 'rgba(0, 0, 0, 0.8)',
-          fontColor: 'white',
-          fontSize: 14,
-          borderColor: 'magenta',
-          borderThickness: 1.0,
-          inFront: true,
-          showBackground: true
-        });
-      }
-      
-      // First zoom out slightly to provide context
-      try {
-        viewer3D.zoomTo();
-      } catch (error) {
-        console.warn('Initial zoom failed, retrying...', error);
-      }
-      
-      // Then zoom to the selected residue with animation
-      setTimeout(async () => {
-        try {
-          viewer3D.zoomTo({ resi: residuePosition }, 1000);
-          await new Promise(resolve => setTimeout(resolve, 50));
-          viewer3D.render();
-        } catch (error) {
-          console.error('Error during zoom animation:', error);
-        }
-      }, 100);
-      
+      setConfig(config);
     } catch (error) {
-      console.error('Error updating structure view:', error);
-      logEvent(`Error highlighting residue: ${error}`, true);
+      logEvent('Config error: ' + (error as Error).message, true);
     }
-  };
-
-  // Update the label toggle button click handler
-  const toggleLabels = () => {
-    const newShowLabels = !showLabels;
-    setShowLabels(newShowLabels);
-    
-    const viewer3D = viewer3DRef.current;
-    if (!viewer3D) return;
-
-    // Clear existing labels
-    viewer3D.removeAllLabels();
-    
-    // If turning labels on and there's a selected residue, show its label
-    if (newShowLabels && selectedResidue !== null) {
-      const atoms = viewer3D.selectedAtoms({ resi: selectedResidue });
-      if (atoms && atoms.length > 0) {
-        const atom = atoms.find((a: any) => a.atom === 'CA') || atoms[0];
-        viewer3D.addLabel(`${atom.resn}${selectedResidue}`, {
-          position: { x: atom.x, y: atom.y, z: atom.z },
-          backgroundColor: 'rgba(0, 0, 0, 0.8)',
-          fontColor: 'white',
-          fontSize: 14,
-          borderColor: 'magenta',
-          borderThickness: 1.0,
-          inFront: true,
-          showBackground: true
-        });
-      }
-    }
-    
-    viewer3D.render();
-  };
-
-  // Add state for controls expansion
-  const [areControlsExpanded, setAreControlsExpanded] = useState(false);
-
-  const [controlsPanelSize, setControlsPanelSize] = useState({ width: 0, height: 0 });
-  const controlsPanelRef = useRef<HTMLDivElement>(null);
-
-  // Add this function to handle panel expansion/collapse
-  const handlePanelToggle = () => {
-    if (controlsPanelRef.current) {
-      const rect = controlsPanelRef.current.getBoundingClientRect();
-      const currentHeight = rect.height;
-      
-      // If we're collapsing, adjust the position to keep the panel centered on the cursor
-      if (areControlsExpanded) {
-        const newHeight = 64; // Approximate height of collapsed panel
-        const heightDiff = currentHeight - newHeight;
-        setMediaPosition({
-          x: mediaPosition.x,
-          y: mediaPosition.y + (heightDiff / 2)
-        });
-      }
-    }
-    setAreControlsExpanded(!areControlsExpanded);
-  };
+  }, [client, setConfig]);
 
   return (
     <div className="gemini-ui">
@@ -1844,14 +2091,22 @@ export const GeminiUI: React.FC = () => {
 
       <div className="controls-panel">
         <div className="status">
-          <div className={`status-indicator ${connected ? 'status-connected' : ''}`}></div>
-          {connected ? 'Connected' : 'Disconnected'}
+          <div className={`status-indicator ${connectionState}`}></div>
+          <span className="status-text">
+            {connectionState === 'connecting' ? 'Connecting...' : 
+             connectionState === 'connected' ? 'Connected' :
+             connectionState === 'error' ? 'Connection Error' : 'Disconnected'}
+            {autoReconnect && reconnectAttempts > 0 && 
+              ` (Retry ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`
+            }
+          </span>
           <button 
             className="connect-btn"
-            onClick={connected ? handleDisconnect : handleConnect}
-            disabled={isConnecting}
+            onClick={connectionState === 'connected' ? handleDisconnect : handleConnect}
+            disabled={connectionState === 'connecting'}
           >
-            {isConnecting ? 'Connecting...' : connected ? 'Disconnect' : 'Connect'}
+            {connectionState === 'connecting' ? 'Connecting...' : 
+             connectionState === 'connected' ? 'Disconnect' : 'Connect'}
           </button>
         </div>
 
@@ -2128,9 +2383,42 @@ export const GeminiUI: React.FC = () => {
           playsInline
         />
       </div>
+
+      <div className="viewer-container">
+        <ErrorBoundary 
+          fallback={<div className="viewer-error">3D viewer failed to load. Please check browser compatibility.</div>}
+          onError={handleViewerError}
+        >
+          <SNPViewer />
+        </ErrorBoundary>
+      </div>
     </div>
   );
 };
 
 export default GeminiUI;
+
+// Add ErrorBoundary component
+class ErrorBoundary extends React.Component<{
+  children: React.ReactNode;
+  fallback: React.ReactNode;
+  onError?: (error: Error) => void;
+}> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error) {
+    this.props.onError?.(error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback;
+    }
+    return this.props.children;
+  }
+}
 

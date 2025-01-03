@@ -14,10 +14,22 @@
  * limitations under the License.
  */
 
-import { createContext, FC, ReactNode, useContext } from "react";
+import React, { createContext, FC, ReactNode, useContext } from "react";
 import { useLiveAPI, UseLiveAPIResults } from "../hooks/use-live-api";
+import { MultimodalLiveClient } from "../lib/multimodal-live-client";
+import { LiveConfig } from "../multimodal-live-types";
+import { audioContext } from "../lib/utils";
 
-const LiveAPIContext = createContext<UseLiveAPIResults | undefined>(undefined);
+export type LiveAPIContext = {
+  client: MultimodalLiveClient | null;
+  connected: boolean;
+  connect: () => Promise<void>;
+  disconnect: () => Promise<void>;
+  setConfig: (config: LiveConfig) => void;
+  volume: number;
+};
+
+export const LiveAPIContext = createContext<LiveAPIContext | null>(null);
 
 export type LiveAPIProviderProps = {
   children: ReactNode;
@@ -30,10 +42,12 @@ export const LiveAPIProvider: FC<LiveAPIProviderProps> = ({
   apiKey,
   children,
 }) => {
-  const liveAPI = useLiveAPI({ url, apiKey });
-
+  const { client, connected, connect, disconnect, setConfig, volume } = useLiveAPI({
+    url,
+    apiKey,
+  });
   return (
-    <LiveAPIContext.Provider value={liveAPI}>
+    <LiveAPIContext.Provider value={{ client, connected, connect, disconnect, setConfig, volume }}>
       {children}
     </LiveAPIContext.Provider>
   );

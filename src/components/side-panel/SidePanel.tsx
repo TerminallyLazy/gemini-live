@@ -57,14 +57,18 @@ export default function SidePanel() {
 
   // listen for log events and store them
   useEffect(() => {
-    client.on("log", log);
-    return () => {
-      client.off("log", log);
-    };
+    if (client) {
+      client.on("log", log);
+      return () => {
+        client.off("log", log);
+      };
+    }
   }, [client, log]);
 
   const handleSubmit = () => {
-    client.send([{ text: textInput }]);
+    if (client) {
+      client.send([{ text: textInput }]);
+    }
 
     setTextInput("");
     if (inputRef.current) {

@@ -43,7 +43,7 @@ function AltairComponent() {
     setConfig({
       model: "models/gemini-2.0-flash-exp",
       generationConfig: {
-        responseModalities: "audio",
+        responseModalities: ["AUDIO"],
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: {
@@ -76,7 +76,7 @@ function AltairComponent() {
       }
       // send data for the response of your tool call
       // in this case Im just saying it was successful
-      if (toolCall.functionCalls.length) {
+      if (toolCall.functionCalls.length && client) {
         setTimeout(
           () =>
             client.sendToolResponse({
@@ -89,10 +89,12 @@ function AltairComponent() {
         );
       }
     };
-    client.on("toolcall", onToolCall);
-    return () => {
-      client.off("toolcall", onToolCall);
-    };
+    if (client) {
+      client.on("toolcall", onToolCall);
+      return () => {
+        client.off("toolcall", onToolCall);
+      };
+    }
   }, [client]);
 
   const embedRef = useRef<HTMLDivElement>(null);
