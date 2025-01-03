@@ -42,20 +42,15 @@ function AltairComponent() {
   useEffect(() => {
     setConfig({
       model: "models/gemini-2.0-flash-exp",
-      generation_config: {
-        response_modalities: "audio",
-        speech_config: {
-          voice_config: {
-            prebuilt_voice_config: {
-              voice_name: "Puck"
+      generationConfig: {
+        responseModalities: "audio",
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: "Puck"
             }
           }
         }
-      },
-      input_audio_config: {
-        encoding: "LINEAR16",
-        sample_rate_hz: 16000,
-        language_code: "en-US"
       },
       systemInstruction: {
         parts: [{
@@ -86,7 +81,7 @@ function AltairComponent() {
           () =>
             client.sendToolResponse({
               functionResponses: toolCall.functionCalls.map((fc) => ({
-                response: { output: { sucess: true } },
+                response: { output: { success: true } },
                 id: fc.id,
               })),
             }),
