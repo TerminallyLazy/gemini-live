@@ -18,6 +18,7 @@ export const GeminiUI: React.FC = () => {
   const responseAreaRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<$3Dmol.Viewer | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
     const initViewer = () => {
@@ -84,19 +85,67 @@ export const GeminiUI: React.FC = () => {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: 16000,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true
         }
       });
       
+      // Create AudioContext if it doesn't exist
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContext();
+      }
+      
+      const audioCtx = audioContextRef.current;
+      const source = audioCtx.createMediaStreamSource(stream);
+      
+      // Use a fixed buffer size of 2048 samples
+      const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+      
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Resample to 16kHz if needed
+        let audioData;
+        if (audioCtx.sampleRate === 16000) {
+          audioData = new Float32Array(inputData);
+        } else {
+          // Simple downsample by picking every Nth sample
+          const ratio = Math.floor(audioCtx.sampleRate / 16000);
+          audioData = new Float32Array(Math.floor(inputData.length / ratio));
+          for (let i = 0; i < audioData.length; i++) {
+            audioData[i] = inputData[i * ratio];
+          }
+        }
+        
+        // Convert to PCM16
+        const pcm16 = new Int16Array(audioData.length);
+        for (let i = 0; i < audioData.length; i++) {
+          const s = Math.max(-1, Math.min(1, audioData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        
+        // Convert to base64
+        const uint8Array = new Uint8Array(pcm16.buffer);
+        let binary = '';
+        uint8Array.forEach(byte => {
+          binary += String.fromCharCode(byte);
+        });
+        const base64 = btoa(binary);
+        
+        client.sendRealtimeInput([{
+          mimeType: "audio/pcm;rate=16000",
+          data: base64
+        }]);
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      
       setMediaStream(stream);
       setIsStreaming(true);
       logEvent('Started audio streaming');
       
-      // Handle the audio stream with the existing client
-      // This will need to be implemented based on your audio processing needs
     } catch (error) {
       console.error('Error starting audio:', error);
       logEvent('Error starting audio: ' + (error as Error).message, true);
@@ -107,6 +156,10 @@ export const GeminiUI: React.FC = () => {
   const stopAudioRecording = () => {
     if (mediaStream) {
       mediaStream.getTracks().forEach(track => track.stop());
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
     }
     setMediaStream(null);
     setIsStreaming(false);
