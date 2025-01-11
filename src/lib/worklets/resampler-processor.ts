@@ -4,9 +4,9 @@ declare var AudioWorkletProcessor: {
   new(): AudioWorkletProcessor;
 };
 
-declare var registerProcessor: (name: string, processorCtor: new () => AudioWorkletProcessor) => void;
+// declare var registerProcessor: (name: string, processorCtor: new () => AudioWorkletProcessor) => void;
 
-declare var sampleRate: number;
+// declare var sampleRate: number;
 
 interface AudioWorkletProcessor {
   readonly port: MessagePort;

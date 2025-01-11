@@ -243,34 +243,25 @@ export const GeminiUI: React.FC = () => {
   // Modify handleConnect to include setup confirmation handling
   const handleConnect = async () => {
     try {
+      if (!client) {
+        logEvent('Client not initialized', true);
+        return;
+      }
+
       setIsConnecting(true);
+      setConnectionState('connecting');
       
-      // Wait for WebSocket to be ready
-      await new Promise((resolve, reject) => {
-        if (!client) {
-          reject(new Error('Client not initialized'));
-          return;
-        }
-
-        const timeout = setTimeout(() => {
-          reject(new Error('Connection timeout'));
-        }, CONNECTION_TIMEOUT);
-
-        client.on('open', () => {
-          clearTimeout(timeout);
-          resolve(true);
-        });
-
-        client.on('error', (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
-
-      await connect();
-      logEvent('Connected to Gemini API');
+      try {
+        await connect();
+        setConnectionState('connected');
+        logEvent('Connected to Gemini API');
+      } catch (error) {
+        setConnectionState('error');
+        logEvent('Connection error: ' + (error as Error).message, true);
+        throw error;
+      }
     } catch (error) {
-      logEvent('Connection error: ' + (error as Error).message, true);
+      console.error('Connection failed:', error);
     } finally {
       setIsConnecting(false);
     }
@@ -875,19 +866,15 @@ export const GeminiUI: React.FC = () => {
   // Add this function to check if 3Dmol is loaded
   const ensure3DmolLoaded = (): Promise<void> => {
     return new Promise((resolve) => {
-      if (window.$3Dmol) {
-        resolve();
-      } else {
-        // Check every 100ms for up to 5 seconds
-        let attempts = 0;
-        const interval = setInterval(() => {
-          if (window.$3Dmol || attempts > 50) {
-            clearInterval(interval);
-            resolve();
-          }
-          attempts++;
-        }, 100);
-      }
+      const check = () => {
+        if (window.$3Dmol) {
+          // Add extra delay to ensure full initialization
+          setTimeout(resolve, 500);
+        } else {
+          setTimeout(check, 100);
+        }
+      };
+      check();
     });
   };
 
@@ -897,49 +884,85 @@ export const GeminiUI: React.FC = () => {
       // Wait for 3Dmol to be loaded
       await ensure3DmolLoaded();
       
-      // Wait for the container to be ready
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
+      // Get container and check if it exists
       const container = document.getElementById('viewer-container');
       if (!container) {
         throw new Error('Viewer container not found');
       }
 
-      // Clear any existing content
+      // Clear any existing content and ensure container is visible
       container.innerHTML = '';
+      container.style.display = 'block';
+      
+      // Force a reflow to ensure the container is properly sized
+      void container.offsetHeight;
 
-      // Create viewer with explicit dimensions
+      // Create viewer with explicit dimensions and WebGL settings
       const config = {
         backgroundColor: 'black',
         antialias: true,
         disableFog: true,
         width: container.clientWidth || 800,
-        height: container.clientHeight || 600
+        height: container.clientHeight || 600,
+        id: 'viewer' + Date.now(), // Unique ID to prevent conflicts
+        defaultcolors: (window as any).$3Dmol.elementColors.rasmol,
+        powerOf2: true, // Force power of 2 textures for better compatibility
       };
 
       console.log('Creating viewer with config:', config);
       
-      // Create viewer and wait for it to be ready
-      const viewer = (window as any).$3Dmol.createViewer(container, config);
+      // Create viewer with error handling
+      let viewer = null;
+      try {
+        viewer = (window as any).$3Dmol.createViewer(container, config);
+      } catch (e) {
+        console.error('First viewer creation attempt failed:', e);
+        // Wait and try again
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        viewer = (window as any).$3Dmol.createViewer(container, config);
+      }
+      
       if (!viewer) {
         throw new Error('Failed to create 3DMol viewer');
       }
 
-      // Wait for viewer to be fully initialized
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Initialize WebGL context with error handling
+      const initWebGL = async () => {
+        try {
+          // Add a dummy model to force WebGL context creation
+          viewer.addSphere({ center: {x: 0, y: 0, z: 0}, radius: 0.1, color: 'black' });
+          viewer.zoomTo();
+          await new Promise(resolve => setTimeout(resolve, 100));
+          viewer.clear();
+          
+          // Set initial view parameters
+          viewer.setBackgroundColor('black');
+          viewer.setStyle({}, { cartoon: { color: 'spectrum' } });
+          
+          // Test render with retry
+          const testRender = async (attempts = 0) => {
+            try {
+              if (viewer.render && typeof viewer.render === 'function') {
+                viewer.render();
+              }
+            } catch (renderError) {
+              console.warn(`Render attempt ${attempts + 1} failed:`, renderError);
+              if (attempts < 3) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                await testRender(attempts + 1);
+              } else {
+                throw new Error('Failed to initialize WebGL context after multiple attempts');
+              }
+            }
+          };
+          
+          await testRender();
+        } catch (error) {
+          throw new Error(`WebGL initialization failed: ${(error as Error).message}`);
+        }
+      };
 
-      // Set initial view parameters
-      viewer.setBackgroundColor('black');
-      viewer.setStyle({}, { cartoon: { color: 'spectrum' } });
-      
-      // Ensure the viewer is ready before rendering
-      try {
-        viewer.render();
-      } catch (renderError) {
-        console.warn('Initial render failed, retrying...', renderError);
-        await new Promise(resolve => setTimeout(resolve, 100));
-        viewer.render();
-      }
+      await initWebGL();
       
       viewer3DRef.current = viewer;
       console.log('3DMol viewer initialized successfully');
@@ -2003,7 +2026,7 @@ export const GeminiUI: React.FC = () => {
     const config: LiveConfig = {
       model: GEMINI_CONFIG.model,
       generationConfig: {
-        responseModalities: ['TEXT', 'AUDIO'],
+        responseModalities: 'audio',
         speechConfig: {
           voiceConfig: {
             prebuiltVoiceConfig: {

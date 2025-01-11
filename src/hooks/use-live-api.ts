@@ -38,22 +38,24 @@ export function useLiveAPI({
   url,
   apiKey,
 }: MultimodalLiveAPIClientConnection): UseLiveAPIResults {
-  const clientRef = useRef<MultimodalLiveClient | null>(null);
-  
-  // Initialize client only once
-  if (!clientRef.current) {
-    clientRef.current = new MultimodalLiveClient({ url, apiKey });
-  }
-  
-  const client = clientRef.current;
+  const client = useMemo(
+    () => new MultimodalLiveClient({ url, apiKey }),
+    [url, apiKey],
+  );
   const audioStreamerRef = useRef<AudioStreamer | null>(null);
 
   const [connected, setConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
   const [config, setConfig] = useState<LiveConfig>({
     model: "models/gemini-2.0-flash-exp",
     generationConfig: {
-      responseModalities: ["AUDIO"]
+      responseModalities: "audio",
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: "Puck"
+          }
+        }
+      }
     }
   });
   const [volume, setVolume] = useState(0);
@@ -75,74 +77,43 @@ export function useLiveAPI({
   }, [audioStreamerRef]);
 
   useEffect(() => {
-    const onOpen = () => {
-      console.log("WebSocket connection opened");
-      setConnected(true);
-      setIsConnecting(false);
-    };
-
     const onClose = () => {
-      console.log("WebSocket connection closed");
       setConnected(false);
-      setIsConnecting(false);
     };
-
 
     const stopAudioStreamer = () => audioStreamerRef.current?.stop();
 
-    const onAudio = (data: ArrayBuffer) => {
+    const onAudio = (data: ArrayBuffer) =>
       audioStreamerRef.current?.addPCM16(new Uint8Array(data));
-    };
 
     client
-      .on("open", onOpen)
       .on("close", onClose)
       .on("interrupted", stopAudioStreamer)
-      .on("audio", onAudio)
-      .on("log", (log) => console.log('useLiveAPI client log:', log));
+      .on("audio", onAudio);
 
     return () => {
       client
-        .off("open", onOpen)
         .off("close", onClose)
         .off("interrupted", stopAudioStreamer)
-        .off("audio", onAudio)
-        .off("log", (log) => console.log('useLiveAPI client log:', log));
+        .off("audio", onAudio);
     };
   }, [client]);
 
+
   const connect = useCallback(async () => {
+    console.log(config);
     if (!config) {
       throw new Error("config has not been set");
     }
-
-    if (isConnecting) {
-      return;
-    }
-
-    try {
-      setIsConnecting(true);
-      await client.disconnect();
-      await client.connect(config);
-      // Connected state will be set by the "open" event handler
-    } catch (error) {
-      console.error("Connection failed:", error);
-      setConnected(false);
-      setIsConnecting(false);
-      throw error;
-    }
-  }, [client, config, isConnecting]);
+    client.disconnect();
+    await client.connect(config);
+    setConnected(true);
+  }, [client, setConnected, config]);
 
   const disconnect = useCallback(async () => {
-    try {
-      await client.disconnect();
-      // Connected state will be set by the "close" event handler
-    } catch (error) {
-      console.error("Disconnect failed:", error);
-      setConnected(false);
-      throw error;
-    }
-  }, [client]);
+    client.disconnect();
+    setConnected(false);
+  }, [setConnected, client]);
 
   return {
     client,

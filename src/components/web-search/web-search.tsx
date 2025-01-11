@@ -1,7 +1,7 @@
 import { type FunctionDeclaration, Part, SchemaType } from "@google/generative-ai";
 import { useEffect, useState, memo } from "react";
 import { useLiveAPIContext } from "../../contexts/LiveAPIContext";
-import { ToolCall, ContentPart, GoogleSearchPart, ServerContent } from "../../multimodal-live-types"; // Import necessary types
+import { ToolCall, ServerContent } from "../../multimodal-live-types"; // Import necessary types
 
 // 1. Define the Function Declaration for Web Search
 const searchDeclaration: FunctionDeclaration = {
@@ -39,7 +39,7 @@ const WebSearchComponent = () => {
     setConfig({
       model: "models/gemini-2.0-flash-exp", // Or your preferred Gemini model
       generationConfig: {
-        responseModalities: ["TEXT"],
+        responseModalities: "audio",
       },
       tools: [{
         functionDeclarations: [searchDeclaration]
@@ -92,9 +92,9 @@ const WebSearchComponent = () => {
     const onContent = (content: ServerContent) => {
       if ('modelTurn' in content && content.modelTurn.parts?.length > 0) {
         const resultsPart = content.modelTurn.parts.find(
-          (part: Part): part is Part & GoogleSearchPart =>
+          (part: Part): part is Part & { googleSearch: { results: any[] } } =>
             'googleSearch' in part &&
-            Array.isArray((part as GoogleSearchPart).googleSearch?.results)
+            Array.isArray((part as { googleSearch: { results: any[] } }).googleSearch?.results)
         );
   
         if (resultsPart && client) {

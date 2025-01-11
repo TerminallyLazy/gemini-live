@@ -17,7 +17,7 @@ import { type FunctionDeclaration, SchemaType } from "@google/generative-ai";
 import { useEffect, useRef, useState, memo } from "react";
 import vegaEmbed from "vega-embed";
 import { useLiveAPIContext } from "../../contexts/LiveAPIContext";
-import { ToolCall, LiveConfig } from "../../multimodal-live-types";
+import { ToolCall } from "../../multimodal-live-types";
 
 const declaration: FunctionDeclaration = {
   name: "render_altair",
@@ -39,30 +39,30 @@ function AltairComponent() {
   const [jsonString, setJSONString] = useState<string>("");
   const { client, setConfig } = useLiveAPIContext();
 
+
   useEffect(() => {
     setConfig({
       model: "models/gemini-2.0-flash-exp",
       generationConfig: {
-        responseModalities: ["AUDIO"],
+        responseModalities: "audio",
         speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: "Puck"
-            }
-          }
-        }
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
+        },
       },
       systemInstruction: {
-        parts: [{
-          text: 'You are my helpful assistant. Any time I ask you for a graph call the "render_altair" function I have provided you. Dont ask for additional information just make your best judgement.'
-        }]
+        parts: [
+          {
+            text: 'You are my helpful assistant. Any time I ask you for a graph call the "render_altair" function I have provided you. Dont ask for additional information just make your best judgement.',
+          },
+        ],
       },
       tools: [
+        // there is a free-tier quota for search
         { googleSearch: {} },
-        { functionDeclarations: [declaration] }
-      ]
+        { functionDeclarations: [declaration] },
+      ],
     });
-  }, []); // Add empty dependency array
+  }, [setConfig]);
 
   useEffect(() => {
     const onToolCall = (toolCall: ToolCall) => {
@@ -81,21 +81,21 @@ function AltairComponent() {
           () =>
             client.sendToolResponse({
               functionResponses: toolCall.functionCalls.map((fc) => ({
-                response: { output: { success: true } },
+                response: { output: { sucess: true } },
                 id: fc.id,
               })),
-            }),
-          200,
-        );
-      }
-    };
-    if (client) {
-      client.on("toolcall", onToolCall);
-      return () => {
-        client.off("toolcall", onToolCall);
-      };
-    }
-  }, [client]);
+                                                                        }),
+                                                            200,
+                                                );
+                                    }
+                        };
+                        if (client) {
+                                    client.on("toolcall", onToolCall);
+                                    return () => {
+                                                client.off("toolcall", onToolCall);
+                                    };
+                        }
+            }, [client]);
 
   const embedRef = useRef<HTMLDivElement>(null);
 
