@@ -25,7 +25,7 @@ class ResamplerProcessor extends AudioWorkletProcessor {
     this.buffer = new Float32Array(2048);
     this.bufferIndex = 0;
     this.inputSampleRate = options.processorOptions.inputSampleRate || sampleRate;
-    this.outputSampleRate = options.processorOptions.outputSampleRate || 16000;
+    this.outputSampleRate = options.processorOptions.outputSampleRate || 24000;
     this.ratio = this.outputSampleRate / this.inputSampleRate;
     console.log('ResamplerProcessor initialized with input rate:', this.inputSampleRate, 'output rate:', this.outputSampleRate);
   }

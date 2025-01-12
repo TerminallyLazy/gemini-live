@@ -121,7 +121,7 @@ const LiveAudioRecorder: React.FC<LiveAudioRecorderProps> = ({
   onAudioData,
   onVolumeChange,
   isRecording,
-  sampleRate = 16000
+  sampleRate = 24000
 }) => {
   const [error, setError] = useState<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);

@@ -41,7 +41,7 @@ export class AudioRecorder extends EventEmitter {
 
   private starting: Promise<void> | null = null;
 
-  constructor(public sampleRate = 16000) {
+  constructor(public sampleRate = 24000) {
     super();
   }
 

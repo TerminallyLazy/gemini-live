@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, Component } from 'react';
 import { useLiveAPIContext } from '../../contexts/LiveAPIContext';
 import { LiveConfig } from '../../multimodal-live-types';
 import { Part } from '@google/generative-ai';
@@ -127,7 +127,7 @@ const createAudioContext = () => {
   try {
     // Fix for Firefox - create audio context with lower sample rate
     return new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 44100, // Use standard sample rate
+      sampleRate: 24000, // Use standard sample rate
       latencyHint: 'interactive'
     });
   } catch (error) {
@@ -140,6 +140,37 @@ const createAudioContext = () => {
 interface TranscriptionResult {
   text: string;
   confidence?: number;
+}
+
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+  fallback: React.ReactNode;
+  onError?: (error: Error) => void;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+}
+
+// Replace the class-based error boundary with a functional component
+function ErrorBoundary({ children, fallback, onError }: ErrorBoundaryProps): JSX.Element {
+  const [hasError, setHasError] = React.useState(false);
+
+  React.useEffect(() => {
+    const handleError = (error: ErrorEvent) => {
+      setHasError(true);
+      onError?.(error.error);
+    };
+
+    window.addEventListener('error', handleError);
+    return () => window.removeEventListener('error', handleError);
+  }, [onError]);
+
+  if (hasError) {
+    return <>{fallback}</>;
+  }
+
+  return <>{children}</>;
 }
 
 export const GeminiUI: React.FC = () => {
@@ -188,9 +219,9 @@ export const GeminiUI: React.FC = () => {
   const logEvent = (message: string, isError = false, type: 'system' | 'model' = 'system', sender?: 'user' | 'model') => {
     const timestamp = new Date().toLocaleTimeString();
     if (type === 'system') {
-      setSystemMessages(prev => [...prev, { timestamp, message, isError }]);
+      setSystemMessages((prev: any) => [...prev, { timestamp, message, isError }]);
     } else {
-      setModelMessages(prev => [...prev, { timestamp, message, sender: sender || 'model' }]);
+      setModelMessages((prev: any) => [...prev, { timestamp, message, sender: sender || 'model' }]);
     }
   };
 
@@ -486,7 +517,7 @@ export const GeminiUI: React.FC = () => {
       let resampleBuffer: number[] = [];
       let lastSampleTime = 0;
       
-      processor.onaudioprocess = (e) => {
+      processor.onaudioprocess = (e: { inputBuffer: { getChannelData: (arg0: number) => any; }; }) => {
         if (!isStreaming || !client || client.ws?.readyState !== WebSocket.OPEN) return;
         
         try {
@@ -495,7 +526,7 @@ export const GeminiUI: React.FC = () => {
           // Resample to 16kHz using linear interpolation
           for (let i = 0; i < inputData.length; i++) {
             const sampleTime = i / audioContext.sampleRate;
-            const targetSampleTime = lastSampleTime + (1 / 16000);
+            const targetSampleTime = lastSampleTime + (1 / 24000);
             
             if (sampleTime >= targetSampleTime) {
               const prevSample = i > 0 ? inputData[i - 1] : inputData[i];
@@ -516,7 +547,7 @@ export const GeminiUI: React.FC = () => {
                   const base64Data = arrayBufferToBase64(pcmData.buffer);
                   const part: Part = {
                     inlineData: {
-                      mimeType: 'audio/wav;rate=16000',
+                      mimeType: 'audio/wav;rate=24000',
                       data: base64Data
                     }
                   };
@@ -558,7 +589,7 @@ export const GeminiUI: React.FC = () => {
       }
 
       // Create an instance of AudioRecorder with 16kHz sample rate (required for speech recognition)
-      const recorder = new AudioRecorder(16000);
+      const recorder = new AudioRecorder(24000);
       audioRecorderRef.current = recorder;
 
       setIsTranscribing(true);
@@ -570,7 +601,7 @@ export const GeminiUI: React.FC = () => {
           try {
             // Send audio for both transcription and model processing
             client.sendRealtimeInput([{
-              mimeType: 'audio/pcm;rate=16000',
+              mimeType: 'audio/pcm;rate=24000',
               data: chunk
             }]);
           } catch (error) {
@@ -611,7 +642,7 @@ export const GeminiUI: React.FC = () => {
       }
       
       if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach(track => track.stop());
+        mediaStreamRef.current.getTracks().forEach((track: { stop: () => any; }) => track.stop());
         mediaStreamRef.current = null;
       }
 
@@ -2002,7 +2033,7 @@ export const GeminiUI: React.FC = () => {
       if (content.modelTurn?.parts) {
         content.modelTurn.parts.forEach((part: any) => {
           if (part.text && isTranscribing) {
-            setTranscription(prev => {
+            setTranscription((prev: any) => {
               const newTranscription = prev ? `${prev} ${part.text}` : part.text;
               logEvent(`Transcription: ${part.text}`, false, 'model');
               return newTranscription;
@@ -2052,7 +2083,7 @@ export const GeminiUI: React.FC = () => {
             <div className="snp-variants">
               <div className="header">SNP Variants</div>
               <div className="variants-list">
-                {snps.map((snp) => (
+                {snps.map((snp: SNP) => (
                   <div
                     key={snp.id}
                     className={cn('variant-item', { selected: selectedSNP === snp.id })}
@@ -2407,41 +2438,17 @@ export const GeminiUI: React.FC = () => {
         />
       </div>
 
-      <div className="viewer-container">
-        <ErrorBoundary 
-          fallback={<div className="viewer-error">3D viewer failed to load. Please check browser compatibility.</div>}
-          onError={handleViewerError}
-        >
-          <SNPViewer />
-        </ErrorBoundary>
-      </div>
+    <div className="viewer-container">
+      <ErrorBoundary 
+        fallback={<div className="viewer-error">3D viewer failed to load. Please check browser compatibility.</div>}
+        onError={handleViewerError}
+      >
+        <SNPViewer />
+      </ErrorBoundary>
+    </div>
     </div>
   );
 };
 
 export default GeminiUI;
-
-// Add ErrorBoundary component
-class ErrorBoundary extends React.Component<{
-  children: React.ReactNode;
-  fallback: React.ReactNode;
-  onError?: (error: Error) => void;
-}> {
-  state = { hasError: false };
-
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-
-  componentDidCatch(error: Error) {
-    this.props.onError?.(error);
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return this.props.fallback;
-    }
-    return this.props.children;
-  }
-}
 
